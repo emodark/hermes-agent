@@ -480,6 +480,44 @@ def memory_tool(
     if target not in ("memory", "user"):
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    # ── Auto-convert: full text → pointer format ────────────────────────
+    # If content doesn't match [TIER]... | → h:... format, auto-store the
+    # full content to hindsight and convert to pointer.
+    if target == "memory" and action in ("add", "replace") and content:
+        content_stripped = content.strip()
+        has_tier = content_stripped.startswith(("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"))
+        has_pointer = "→ h:" in content_stripped
+        if not (has_tier and has_pointer):
+            # Auto-store to hindsight, convert content to pointer format
+            import hashlib, logging as log_mod, subprocess
+            log = log_mod.getLogger(__name__)
+            hindsight_key = "auto_" + hashlib.md5(content.encode()).hexdigest()[:12]
+            brief = content_stripped.split("\n")[0][:60]
+            auto_tier = "LTM"
+            pointer_entry = f"[{auto_tier}] {brief} | → h:{hindsight_key}"
+            log.info("Auto-convert memory → pointer: %s (hindsight_key=%s)", brief, hindsight_key)
+
+            # Fire-and-forget hindsight retain
+            try:
+                payload = json.dumps({
+                    "items": [{
+                        "content": content_stripped[:3000],
+                        "tags": ["auto-memory", f"key:{hindsight_key}"],
+                        "context": f"auto-converted",
+                    }]
+                })
+                subprocess.run(
+                    ["curl", "-s", "-X", "POST",
+                     "http://127.0.0.1:9177/v1/default/banks/hermes/memories",
+                     "-H", "Content-Type: application/json", "-d", payload],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
+
+            # Override content with pointer format
+            content = pointer_entry
+
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
