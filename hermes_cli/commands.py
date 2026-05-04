@@ -198,6 +198,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
 
+    # Instincts
+    CommandDef("instinct", "Show tool usage instincts (learned behavior patterns)", "Info",
+               aliases=("instincts",), args_hint="[status|analyze|observations|prompt]"),
+
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",
                cli_only=True, aliases=("exit",)),

@@ -5052,6 +5052,16 @@ class AIAgent:
             except Exception:
                 pass
 
+        # Layer 8: Learned instincts (from automatic behavior pattern analysis)
+        if self._memory_manager is not None:
+            try:
+                from agent.instincts import inject_instincts_prompt
+                _instinct_block = inject_instincts_prompt(threshold=0.7)
+                if _instinct_block:
+                    prompt_parts.append(_instinct_block)
+            except Exception:
+                pass
+
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
 
     # =========================================================================
