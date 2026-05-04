@@ -9117,6 +9117,8 @@ class HermesCLI:
             self._handle_voice_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
+        elif canonical == "instinct":
+            self._handle_instinct_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -10275,6 +10277,45 @@ class HermesCLI:
             _cprint(f"  {_DIM}{behavior}{_RST}")
         else:
             _cprint(f"  {_ACCENT}✓ Busy input mode set to '{arg}' (session only){_RST}")
+
+    def _handle_instinct_command(self, cmd: str):
+        """Handle /instinct — show/analyze learned tool usage patterns.
+
+        Usage:
+            /instinct               Show instinct status summary
+            /instinct status        Show observation & instinct statistics
+            /instinct analyze       Run analysis and update instincts
+            /instinct observations  Show recent tool call observations
+            /instinct prompt        Show system prompt block
+        """
+        import subprocess, sys
+        script = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                              "scripts", "instinct_analyzer.py")
+        if not os.path.exists(script):
+            _cprint(f"  {_ERR} Instinct analyzer not found at {script}")
+            return
+
+        parts = cmd.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        flag_map = {
+            "": "--status",
+            "status": "--status",
+            "analyze": "",
+            "observations": "--observations",
+            "prompt": "--prompt",
+        }
+        flag = flag_map.get(arg, "--status")
+
+        try:
+            result = subprocess.run(
+                [sys.executable, script] + ([flag] if flag else []),
+                capture_output=True, text=True, timeout=30,
+            )
+            output = result.stdout or result.stderr or "(no output)"
+            print(output)
+        except subprocess.TimeoutExpired:
+            _cprint(f"  {_ERR} Analysis timed out (try /instinct status for quick stats)")
 
     def _handle_fast_command(self, cmd: str):
         """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""

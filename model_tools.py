@@ -1103,6 +1103,19 @@ def handle_function_call(
             duration_ms=duration_ms,
         )
 
+        # ── Instinct observation: record tool usage for pattern learning ──
+        try:
+            from agent.instincts import record_observation
+            record_observation(
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                duration_ms=duration_ms,
+                session_id=session_id or "",
+            )
+        except Exception:
+            pass
+
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by
         # returning a string from transform_tool_result. Runs after

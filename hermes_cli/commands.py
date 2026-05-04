@@ -219,6 +219,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("version", "Show Hermes Agent version", "Info", aliases=("v",)),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
 
+    # Instincts
+    CommandDef("instinct", "Show tool usage instincts (learned behavior patterns)", "Info",
+               aliases=("instincts",), args_hint="[status|analyze|observations|prompt]"),
+
     # Exit
     CommandDef("quit", "Exit the CLI (use --delete to also remove session history)", "Exit",
                cli_only=True, aliases=("exit",), args_hint="[--delete]"),
