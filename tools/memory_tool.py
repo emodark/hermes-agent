@@ -493,43 +493,17 @@ def memory_tool(
             log = log_mod.getLogger(__name__)
             hindsight_key = "auto_" + hashlib.md5(content.encode()).hexdigest()[:12]
             brief = content_stripped.split("\n")[0][:60]
-            # Strip existing tier tag if present (auto-convert normalizes to [STM])
-            if has_tier:
-                for tag in ("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"):
-                    if brief.startswith(tag):
-                        brief = brief[len(tag):].lstrip()
-                        break
-            auto_tier = "STM"
+            auto_tier = "LTM"
             pointer_entry = f"[{auto_tier}] {brief} | → h:{hindsight_key}"
             log.info("Auto-convert memory → pointer: %s (hindsight_key=%s)", brief, hindsight_key)
 
             # Fire-and-forget hindsight retain
             try:
-                # Build tags: base + entity/relation tags from content
-                extra_tags = ["auto-memory", f"key:{hindsight_key}"]
-
-                # If content contains AMAP routing entries, add entity tags
-                if "[AMAP]" in content_stripped:
-                    extra_tags.append("entity|concept:amap_routing")
-                    for line in content_stripped.split("\n"):
-                        m = re.search(r'→\s*(entity\|\w+:\w+)', line)
-                        if m:
-                            extra_tags.append(m.group(1))
-
-                # If content contains explicit entity| or relation| tags, pass through
-                if "entity|" in content_stripped or "relation|" in content_stripped:
-                    for line in content_stripped.split("\n"):
-                        line = line.strip()
-                        if line.startswith(("entity|", "relation|")) or "|entity|" in line:
-                            m = re.search(r'(entity\|\w+:\w+|relation\|\w+:\w+)', line)
-                            if m and m.group(1) not in extra_tags:
-                                extra_tags.append(m.group(1))
-
                 payload = json.dumps({
                     "items": [{
                         "content": content_stripped[:3000],
-                        "tags": extra_tags,
-                        "context": "auto-converted",
+                        "tags": ["auto-memory", f"key:{hindsight_key}"],
+                        "context": f"auto-converted",
                     }]
                 })
                 subprocess.run(
