@@ -493,7 +493,13 @@ def memory_tool(
             log = log_mod.getLogger(__name__)
             hindsight_key = "auto_" + hashlib.md5(content.encode()).hexdigest()[:12]
             brief = content_stripped.split("\n")[0][:60]
-            auto_tier = "LTM"
+            # Strip existing tier tag if present (auto-convert normalizes to [STM])
+            if has_tier:
+                for tag in ("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"):
+                    if brief.startswith(tag):
+                        brief = brief[len(tag):].lstrip()
+                        break
+            auto_tier = "STM"
             pointer_entry = f"[{auto_tier}] {brief} | → h:{hindsight_key}"
             log.info("Auto-convert memory → pointer: %s (hindsight_key=%s)", brief, hindsight_key)
 
