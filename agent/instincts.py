@@ -77,9 +77,16 @@ def record_observation(
             result_preview = result[:200]
             try:
                 parsed = json.loads(result)
-                if isinstance(parsed, dict) and "error" in parsed:
-                    success = False
-                    result_preview = f"ERROR: {parsed['error'][:200]}"
+                if isinstance(parsed, dict):
+                    # Check real error message (not null/None)
+                    if parsed.get("error"):
+                        success = False
+                        result_preview = f"ERROR: {parsed['error'][:200]}"
+                    # For terminal-like tools, check exit_code
+                    if "exit_code" in parsed and parsed["exit_code"] != 0:
+                        success = False
+                        if not result_preview.startswith("ERROR:"):
+                            result_preview = f"ERROR: exit_code={parsed['exit_code']}"
             except (json.JSONDecodeError, TypeError):
                 pass
 

@@ -490,6 +490,40 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
 
+    # ── TiMEM Scene auto-classification keywords ──────────────────────────
+    _SCENE_KEYWORDS = {
+        "stock":   ["股票", "K线", "涨停", "跌停", "ADX", "BOLL", "持仓", "买入", "卖出",
+                     "行情", "大盘", "板块", "仓位", "止损", "止盈", "均线", "成交量",
+                     "换手率", "趋势", "突破", "回调", "反弹", "支撑", "压力"],
+        "dev":     ["bug", "修复", "部署", "配置", "API", "skill", "MongoDB", "git",
+                     "错误", "报错", "调试", "代码", "函数", "类", "模块", "重构",
+                     "升级", "迁移", "版本", "commit", "push", "PR"],
+        "life":    ["猫", "福宝", "吃饭", "天气", "旅行", "日记", "生活", "个人",
+                     "德文", "宠物", "健康", "运动", "电影", "音乐"],
+        "project": ["方案", "计划", "设计", "架构", "路线图", "需求", "规划",
+                     "文档", "设计稿", "顶层设计", "流程图", "分析", "对比",
+                     "调研", "评审", "里程碑", "deadline"],
+        "trading": ["交易", "止损", "仓位", "预期", "目标价", "风报比",
+                     "加仓", "减仓", "清仓", "底仓", "做T", "回撤", "胜率",
+                     "盈亏比", "信号", "入场", "出场"],
+    }
+
+    def _infer_scene(self, content: str) -> str:
+        """Auto-infer scene tag from content keywords."""
+        if not content:
+            return ""
+        content_lower = content.lower()
+        scores = {}
+        for scene_name, keywords in self._SCENE_KEYWORDS.items():
+            score = sum(1 for kw in keywords if kw.lower() in content_lower)
+            if score > 0:
+                scores[scene_name] = score
+        if not scores:
+            return ""
+        return max(scores, key=scores.get)
+
+    # ── Session message helpers ───────────────────────────────────────────
+
     @property
     def name(self) -> str:
         return "hindsight"
@@ -1157,6 +1191,44 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    # ── 艾宾浩斯时间衰减重排序 ──
+    @staticmethod
+    def _rerank_with_time_decay(results, halflife_days: int = 60):
+        """对RecallResults做混合排序：60%语义相关(按position) + 40%艾宾浩斯时间衰减。
+
+        Returns:
+            List of (hybrid_score, decay, age_days, text, original_item)
+            按 hybrid_score 降序排列。
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        n = len(results)
+        scored = []
+        for i, r in enumerate(results):
+            if not r.text:
+                continue
+            # 语义相关度代理：API返回顺序=相关度降序
+            position_weight = 1.0 - (i / max(n - 1, 1)) * 0.8 if n > 1 else 1.0
+
+            # 艾宾浩斯时间衰减
+            ts_str = r.occurred_start or r.mentioned_at
+            age_days = 0
+            if ts_str:
+                try:
+                    clean_ts = ts_str.replace("Z", "+00:00")
+                    ts = datetime.fromisoformat(clean_ts)
+                    age_days = (now - ts).days
+                except (ValueError, TypeError):
+                    pass
+            decay = max(0.05, 2.0 ** (-age_days / halflife_days))
+
+            # 混合分：60%语义 + 40%时间
+            score = position_weight * 0.6 + decay * 0.4
+            scored.append((score, decay, age_days, r.text, r))
+
+        scored.sort(key=lambda x: -x[0])
+        return scored
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1192,12 +1264,38 @@ class HindsightMemoryProvider(MemoryProvider):
                     resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                     num_results = len(resp.results) if resp.results else 0
                     logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                    # 艾宾浩斯时间衰减重排序
+                    scored = self._rerank_with_time_decay(resp.results or [])
+                    text = "\n".join(f"- {s[3]}" for s in scored) if scored else ""
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
             except Exception as e:
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
+
+            # ── Also fetch latest summaries for cross-session continuity ──
+            try:
+                summary_kwargs: dict = {
+                    "bank_id": self._bank_id, "query": "",
+                    "budget": "low", "max_tokens": 3000,
+                    "tags": ["session-summary", "daily-summary"],
+                    "tags_match": "any",
+                }
+                s_resp = self._run_hindsight_operation(
+                    lambda client: client.arecall(**summary_kwargs)
+                )
+                if s_resp and s_resp.results:
+                    s_lines = [f"- {r.text}" for r in s_resp.results[:3] if r.text]
+                    if s_lines:
+                        s_text = "\n".join(s_lines)
+                        with self._prefetch_lock:
+                            if self._prefetch_result:
+                                self._prefetch_result = s_text + "\n\n" + self._prefetch_result
+                            else:
+                                self._prefetch_result = s_text
+                        logger.debug("Prefetch: appended %d session-summaries", len(s_lines))
+            except Exception as e:
+                logger.debug("Session-summary prefetch failed: %s", e, exc_info=True)
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -1360,14 +1458,19 @@ class HindsightMemoryProvider(MemoryProvider):
             if not content:
                 return tool_error("Missing required parameter: content")
             context = args.get("context")
+            # TiMEM P1: auto-infer scene and inject as tag (not content prefix)
+            scene_tag = self._infer_scene(content)
+            user_tags = list(args.get("tags") or [])
+            if scene_tag and scene_tag not in user_tags:
+                user_tags.append(scene_tag)
             try:
                 retain_kwargs = self._build_retain_kwargs(
                     content,
                     context=context,
-                    tags=args.get("tags"),
+                    tags=user_tags or None,
                 )
-                logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
-                             self._bank_id, len(content), context)
+                logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s, scene=%s",
+                             self._bank_id, len(content), context, scene_tag or "none")
                 self._run_hindsight_operation(lambda client: client.aretain(**retain_kwargs))
                 logger.debug("Tool hindsight_retain: success")
                 return json.dumps({"result": "Memory stored successfully."})
@@ -1396,7 +1499,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                # 艾宾浩斯时间衰减重排序
+                scored = self._rerank_with_time_decay(resp.results)
+                lines = [f"{i}. {s[3]}" for i, s in enumerate(scored, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
@@ -1541,6 +1646,122 @@ class HindsightMemoryProvider(MemoryProvider):
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
             self._session_id, self._parent_session_id, reset, self._document_id,
         )
+
+    # ── TiMEM P2: Session summary + chain consolidation ─────────────────
+
+    def _build_session_summary(self) -> str:
+        """Build a compact summary of this session's turns."""
+        if not self._session_turns:
+            return ""
+        # Extract unique topic lines
+        seen: set[str] = set()
+        items: list[str] = []
+        for t in self._session_turns:
+            try:
+                parsed = json.loads(t)
+                for msg in parsed if isinstance(parsed, list) else [parsed]:
+                    text = (msg.get("content") or "")[:200]
+                    if text and text not in seen:
+                        seen.add(text)
+                        items.append(f"- {text}")
+            except (json.JSONDecodeError, TypeError):
+                text = str(t)[:200]
+                if text and text not in seen:
+                    seen.add(text)
+                    items.append(f"- {text}")
+
+        if not items:
+            return ""
+        prefix = f"【会话摘要·{self._session_id[:12] if self._session_id else 'unknown'}】"
+        summary = f"{prefix}本会话共{len(self._session_turns)}轮\n" + "\n".join(items[:20])
+        if len(items) > 20:
+            summary += f"\n  ... 还有 {len(items) - 20} 条"
+        return summary
+
+    def on_session_end(self, messages: list[dict]) -> None:
+        """Generate session summary and trigger chain consolidation (P2).
+
+        Called when a session ends (CLI exit, /reset, gateway expiry).
+        Stores a session-summary, then chains to daily-summary.
+        """
+        try:
+            summary = self._build_session_summary()
+            if not summary:
+                return
+
+            scene_tag = self._infer_scene(summary)
+            lineage_tags = [f"session:{self._session_id}"] if self._session_id else []
+            all_tags = ["session-summary"] + lineage_tags
+            if scene_tag and scene_tag not in all_tags:
+                all_tags.append(scene_tag)
+            retain_kwargs = self._build_retain_kwargs(
+                summary,
+                context="auto-session-summary",
+                tags=all_tags,
+            )
+            retain_kwargs.pop("bank_id", None)
+            retain_kwargs.pop("retain_async", None)
+            self._run_hindsight_operation(
+                lambda client: client.aretain_batch(
+                    bank_id=self._bank_id,
+                    items=[retain_kwargs],
+                    document_id=self._document_id,
+                    retain_async=self._retain_async,
+                )
+            )
+            logger.debug("on_session_end: session-summary stored")
+        except Exception as e:
+            logger.debug("on_session_end (session-summary) failed: %s", e)
+
+        # Chain: search today's session-summaries → daily-summary
+        try:
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if not self._run_hindsight_operation:
+                return
+            # Recall today's session-summaries
+            recall_kwargs = {
+                "bank_id": self._bank_id,
+                "query": date_str,
+                "budget": "low",
+                "max_tokens": 2048,
+                "tags": ["session-summary"],
+                "tags_match": "any",
+            }
+            resp = self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs)
+            )
+            if not resp or not resp.results or len(resp.results) < 2:
+                logger.debug("chain: not enough session-summaries yet (<2)")
+                return
+
+            lines = [f"- {r.text[:200]}" for r in resp.results[:15]]
+            daily = (
+                f"【日汇总·{date_str}】"
+                f"共{len(resp.results)}条会话摘要\n"
+                + "\n".join(lines)
+            )
+            scene_tag_daily = self._infer_scene(daily)
+            daily_tags = ["daily-summary", f"date:{date_str}"]
+            if scene_tag_daily and scene_tag_daily not in daily_tags:
+                daily_tags.append(scene_tag_daily)
+            daily_kwargs = self._build_retain_kwargs(
+                daily,
+                context="auto-daily-summary",
+                tags=daily_tags,
+            )
+            daily_kwargs.pop("bank_id", None)
+            daily_kwargs.pop("retain_async", None)
+            self._run_hindsight_operation(
+                lambda client: client.aretain_batch(
+                    bank_id=self._bank_id,
+                    items=[daily_kwargs],
+                    document_id=self._document_id,
+                    retain_async=self._retain_async,
+                )
+            )
+            logger.debug("chain: daily-summary stored for %s", date_str)
+        except Exception as e:
+            logger.debug("chain consolidation failed: %s", e)
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
