@@ -35,7 +35,6 @@ import json
 import logging
 import os
 import queue
-import re
 import threading
 
 from datetime import datetime, timezone
@@ -54,12 +53,6 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.4.22"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
-# Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
-# `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
-# Without it, reusing a stable session-scoped document_id silently
-# overwrites prior turns server-side, so we keep the per-process
-# unique document_id fallback for older APIs.
-_MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
@@ -99,95 +92,6 @@ def _check_local_runtime() -> tuple[bool, str | None]:
         return True, None
     except Exception as exc:
         return False, str(exc)
-
-
-# ---------------------------------------------------------------------------
-# Hindsight API capability probe — mirrors hindsight-integrations/openclaw.
-# ---------------------------------------------------------------------------
-
-# Cache of API_URL -> bool (whether that API supports update_mode='append').
-# Probed once per URL per process — every provider talking to the same API
-# gets the same answer without re-hitting /version on each initialize().
-_append_capability_cache: Dict[str, bool] = {}
-_append_capability_lock = threading.Lock()
-
-
-def _meets_minimum_version(actual: str | None, required: str) -> bool:
-    """Return True if *actual* ≥ *required* (semver). False on missing/invalid."""
-    if not actual:
-        return False
-    try:
-        from packaging.version import Version
-        return Version(actual) >= Version(required)
-    except Exception:
-        return False
-
-
-def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
-                                 timeout: float = 5.0) -> str | None:
-    """GET ``<api_url>/version`` and return the version string (or None on failure).
-
-    Hindsight's `/version` endpoint returns ``{"version": "0.5.6", ...}``.
-    Any failure (timeout, 404, malformed JSON, missing key) → None, which
-    the caller treats as "legacy API, no update_mode support".
-    """
-    import urllib.error
-    import urllib.request
-    if not api_url:
-        return None
-    url = api_url.rstrip("/") + "/version"
-    req = urllib.request.Request(url)
-    if api_key:
-        req.add_header("Authorization", f"Bearer {api_key}")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            payload = resp.read().decode("utf-8", errors="replace")
-        data = json.loads(payload)
-    except Exception as exc:
-        logger.debug("Hindsight /version probe failed for %s: %s", url, exc)
-        return None
-    if not isinstance(data, dict):
-        return None
-    version = data.get("version") or data.get("api_version")
-    return str(version) if version else None
-
-
-def _check_api_supports_update_mode_append(api_url: str,
-                                           api_key: str | None = None) -> bool:
-    """Cached capability check for ``update_mode='append'`` on *api_url*.
-
-    Probes once per URL per process. Returns False on any probe failure —
-    that's the safe default: a per-process unique ``document_id`` and no
-    ``update_mode`` keeps the resume-overwrite fix (#6654) intact.
-    """
-    if not api_url:
-        return False
-    with _append_capability_lock:
-        if api_url in _append_capability_cache:
-            return _append_capability_cache[api_url]
-    version = _fetch_hindsight_api_version(api_url, api_key)
-    supported = _meets_minimum_version(version, _MIN_VERSION_FOR_UPDATE_MODE_APPEND)
-    with _append_capability_lock:
-        # Re-check after acquiring the lock in case a concurrent probe filled it.
-        cached = _append_capability_cache.get(api_url)
-        if cached is None:
-            _append_capability_cache[api_url] = supported
-        else:
-            supported = cached
-    if not supported:
-        logger.warning(
-            "Hindsight API at %s reports version %r, older than %s. "
-            "Falling back to per-process document_id — retains across "
-            "processes/sessions create separate documents instead of "
-            "appending to a session-scoped one. Upgrade Hindsight to "
-            "%s+ to enable update_mode='append' deduplication.",
-            api_url, version, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
-            _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
-        )
-    else:
-        logger.debug("Hindsight API %s version %s supports update_mode='append'",
-                     api_url, version)
-    return supported
 
 
 # ---------------------------------------------------------------------------
@@ -1061,40 +965,6 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client))
 
-    def _probe_url(self) -> str:
-        """Return the URL to probe /version on.
-
-        For local_embedded the daemon is on a per-profile dynamic port,
-        so we prefer the running client's URL when available; otherwise
-        fall back to the configured api_url.
-        """
-        if self._mode == "local_embedded" and self._client is not None:
-            url = getattr(self._client, "url", None)
-            if url:
-                return str(url)
-        return self._api_url or ""
-
-    def _resolve_retain_target(self, fallback_document_id: str) -> tuple[str, str | None]:
-        """Pick (document_id, update_mode) based on live API capability.
-
-        On Hindsight ≥ 0.5.0 the API supports ``update_mode='append'``,
-        which lets us reuse a stable session-scoped ``document_id`` across
-        process lifecycles without overwriting prior turns. On older APIs
-        we fall back to *fallback_document_id* (the per-process unique
-        ``f"{session_id}-{start_ts}"`` minted at initialize / switch time)
-        and don't pass ``update_mode`` at all — that's the only way the
-        resume-overwrite fix (#6654) keeps working on legacy servers.
-
-        Probe is cached at module level per API URL, so this is one HTTP
-        round-trip per (process, api_url) pair regardless of how many
-        retains fire.
-        """
-        if not self._session_id:
-            return fallback_document_id, None
-        if _check_api_supports_update_mode_append(self._probe_url(), self._api_key):
-            return self._session_id, "append"
-        return fallback_document_id, None
-
     # ── Entity/Relation tag parsing for associative memory ─────────────────
     _ENTITY_RE = re.compile(r'^entity\|(\w+):(.+)$')
     _RELATION_RE = re.compile(r'^relation\|(\w+):(.+)$')
@@ -1169,65 +1039,6 @@ class HindsightMemoryProvider(MemoryProvider):
         "元知识": "entity|concept:meta_knowledge",
         "负债表": "entity|object:balance_sheet",
     }
-    # Dynamic routes discovered from memory graph (auto-expanded)
-    _AMAP_DYNAMIC_ROUTES: dict[str, str] = {}
-    _AMAP_DYNAMIC_PREFETCH_COUNT = 0
-
-    # Auto-tag keywords: content keywords → entity tag for retain auto-labeling
-    _AMAP_ENTITY_KEYWORDS = {
-        "entity|object:weekly_recommend": ["每周推荐", "weekly_recommend", "周度分析", "市场扫描"],
-        "entity|object:data_pipeline": ["数据层", "data_pipeline", "K线存储", "指标计算", "kline_storage"],
-        "entity|object:ichimoku_fix": ["一目均衡", "ichimoku", "云图", "cloud", "ichimoku_cloud"],
-        "entity|object:holding_analysis": ["持仓", "holding", "position", "仓位", "持仓分析"],
-        "entity|object:jin10_data": ["金十", "jin10", "快讯", "宏观数据", "经济日历", "macro"],
-        "entity|concept:meta_knowledge": ["元知识", "六步法", "meta_knowledge", "思维模型", "推理链"],
-        "entity|object:balance_sheet": ["负债表", "balance_sheet", "财务数据", "财报"],
-        "entity|object:ecc_system": ["ECC", "本能系统", "置信度", "confid", "instinct"],
-    }
-
-    @staticmethod
-    def _infer_entity_tags_from_content(content: str) -> list[str]:
-        """Auto-infer AMAP entity tags from content keywords."""
-        if not content:
-            return []
-        content_lower = content.lower()
-        tags = []
-        for entity_tag, keywords in type.__dict__.get(
-                "_AMAP_ENTITY_KEYWORDS",
-                HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS).items():
-            for kw in keywords:
-                if kw.lower() in content_lower:
-                    tags.append(entity_tag)
-                    break
-        return tags
-
-    # Auto-tag keywords: content keywords → entity tag for retain auto-labeling
-    _AMAP_ENTITY_KEYWORDS = {
-        "entity|object:weekly_recommend": ["每周推荐", "weekly_recommend", "周度分析", "市场扫描"],
-        "entity|object:data_pipeline": ["数据层", "data_pipeline", "K线存储", "指标计算", "kline_storage"],
-        "entity|object:ichimoku_fix": ["一目均衡", "ichimoku", "云图", "cloud", "ichimoku_cloud"],
-        "entity|object:holding_analysis": ["持仓", "holding", "position", "仓位", "持仓分析"],
-        "entity|object:jin10_data": ["金十", "jin10", "快讯", "宏观数据", "经济日历", "macro"],
-        "entity|concept:meta_knowledge": ["元知识", "六步法", "meta_knowledge", "思维模型", "推理链"],
-        "entity|object:balance_sheet": ["负债表", "balance_sheet", "财务数据", "财报"],
-        "entity|object:ecc_system": ["ECC", "本能系统", "置信度", "confid", "instinct"],
-    }
-
-    @staticmethod
-    def _infer_entity_tags_from_content(content: str) -> list[str]:
-        """Auto-infer AMAP entity tags from content keywords."""
-        if not content:
-            return []
-        content_lower = content.lower()
-        tags = []
-        for entity_tag, keywords in type.__dict__.get(
-                "_AMAP_ENTITY_KEYWORDS",
-                HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS).items():
-            for kw in keywords:
-                if kw.lower() in content_lower:
-                    tags.append(entity_tag)
-                    break
-        return tags
 
     def _basic_recall(self, query: str, limit: int = 10) -> list:
         """Core recall call, returns raw results without expansion."""
@@ -1266,50 +1077,13 @@ class HindsightMemoryProvider(MemoryProvider):
             return []
 
     def _try_amap_match(self, query: str) -> str | None:
-        """Check CORE memory AMAP routes + dynamic routes. Returns entity name if matched."""
+        """Check CORE memory AMAP routes. Returns entity name if matched."""
         query_lower = query.lower()
-        # 先查静态路由
         for keyword, entity in self._AMAP_ROUTES.items():
             if keyword.lower() in query_lower:
                 logger.debug("AMAP matched: '%s' → %s", keyword, entity)
                 return entity
-        # 再查动态路由
-        if self._AMAP_DYNAMIC_ROUTES:
-            for keyword, entity in self._AMAP_DYNAMIC_ROUTES.items():
-                if keyword.lower() in query_lower:
-                    logger.debug("AMAP dynamic matched: '%s' → %s", keyword, entity)
-                    return entity
         return None
-
-    def _update_amap_routes(self) -> int:
-        """从 memory graph 自动发现路由，更新 _AMAP_DYNAMIC_ROUTES。
-
-        每10次 prefetch 调用一次，不阻塞。
-        Returns:
-            新增路由数
-        """
-        try:
-            self._memory_graph.build_from_hindsight()
-            routes = self._memory_graph.discover_routes(min_degree=2)
-            if not routes:
-                return 0
-
-            # 转成 keyword→entity dict，相同 keyword 取最高分
-            new_routes: dict[str, str] = {}
-            for r in routes:
-                kw = r["keyword"]
-                if kw not in new_routes:
-                    new_routes[kw] = r["entity"]
-
-            old_count = len(self._AMAP_DYNAMIC_ROUTES)
-            self._AMAP_DYNAMIC_ROUTES = new_routes
-            added = len(new_routes) - (old_count if old_count > 0 else 0)
-            logger.debug("AMAP dynamic routes updated: %d total, %d new",
-                         len(new_routes), added)
-            return max(0, added)
-        except Exception as e:
-            logger.debug("AMAP route discovery failed: %s", e)
-            return 0
 
     @staticmethod
     def _get_allowed_paths(mode: str) -> set:
@@ -1620,7 +1394,7 @@ class HindsightMemoryProvider(MemoryProvider):
             or os.environ.get("HINDSIGHT_RETAIN_TAGS", "")
         )
         self._tags = self._retain_tags or None
-        self._recall_tags = _normalize_retain_tags(self._config.get("recall_tags")) or None
+        self._recall_tags = self._config.get("recall_tags") or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
@@ -1789,67 +1563,6 @@ class HindsightMemoryProvider(MemoryProvider):
         scored.sort(key=lambda x: -x[0])
         return scored
 
-    def _scene_filter_results(self, scored: list, query: str) -> list:
-        """场景隔离重排序：检测查询场景，同场景结果优先。
-
-        Args:
-            scored: _rerank_with_time_decay 的输出
-            query: 用户查询
-
-        Returns:
-            重排序后的列表（同场景靠前）或完整列表（无场景时）
-        """
-        scene = self._infer_scene(query)
-        if not scene:
-            return scored  # 没有检测到场景，返回原始结果
-
-        same_scene = []
-        other_scene = []
-        no_scene = []
-
-        for item in scored:
-            if len(item) < 5:
-                no_scene.append(item)
-                continue
-            original = item[4]  # recall result object
-            tags = getattr(original, 'tags', None) or []
-            if not tags and isinstance(original, dict):
-                tags = original.get('tags', [])
-
-            found = False
-            for tag in tags:
-                ts = str(tag)
-                if ts == scene:
-                    same_scene.append(item)
-                    found = True
-                    break
-            if not found:
-                # 检查是否包含其他场景标签
-                has_other_scene = False
-                for tag in tags:
-                    ts = str(tag)
-                    if ts in self._SCENE_KEYWORDS:
-                        other_scene.append(item)
-                        has_other_scene = True
-                        break
-                if not has_other_scene:
-                    no_scene.append(item)
-
-        # 场景可见度：同场景返回前 80%，异场景压缩到前 30%，无场景保留前 50%
-        max_same = max(1, len(same_scene))
-        max_other = max(1, len(other_scene) // 3) if other_scene else 0
-        max_none = max(1, len(no_scene) // 2) if no_scene else 0
-
-        result = (same_scene[:max_same]
-                  + no_scene[:max_none]
-                  + other_scene[:max_other])
-
-        if result != scored:
-            logger.debug("Scene filter [%s]: %d same, %d other→%d, %d none→%d → %d total",
-                         scene, len(same_scene), len(other_scene), max_other,
-                         len(no_scene), max_none, len(result))
-        return result if result else scored
-
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1887,18 +1600,11 @@ class HindsightMemoryProvider(MemoryProvider):
                     logger.debug("Prefetch: recall returned %d results", num_results)
                     # 艾宾浩斯时间衰减重排序
                     scored = self._rerank_with_time_decay(resp.results or [])
-                    # 场景隔离重排序：检测查询场景，同场景结果优先
-                    scored = self._scene_filter_results(scored, query)
                     text = "\n".join(f"- {s[3]}" for s in scored) if scored else ""
 
                 # ── PPR 图扩散扩展 ──
                 if self._prefetch_method != "reflect":
                     try:
-                        # 每10次 prefetch 刷新一次动态路由
-                        self._AMAP_DYNAMIC_PREFETCH_COUNT += 1
-                        if self._AMAP_DYNAMIC_PREFETCH_COUNT % 10 == 0:
-                            self._update_amap_routes()
-
                         # Build seed nodes from AMAP + recall results
                         seed_nodes = []
                         amap_entity = self._try_amap_match(query)
@@ -2110,23 +1816,11 @@ class HindsightMemoryProvider(MemoryProvider):
                      len(self._session_turns), sum(len(t) for t in self._session_turns))
         content = "[" + ",".join(self._session_turns) + "]"
 
-        all_tags: list[str] = []
+        lineage_tags: list[str] = []
         if self._session_id:
-            all_tags.append(f"session:{self._session_id}")
+            lineage_tags.append(f"session:{self._session_id}")
         if self._parent_session_id:
-            all_tags.append(f"parent:{self._parent_session_id}")
-
-        # TiMEM P1: auto-infer scene and inject as tag
-        scene_tag = self._infer_scene(content)
-        if scene_tag and scene_tag not in all_tags:
-            all_tags.append(scene_tag)
-
-        # P3.1: Auto-infer AMAP entity tags from content
-        if "--no-auto-entity" not in all_tags:
-            auto_entity_tags = self._infer_entity_tags_from_content(content)
-            for t in auto_entity_tags:
-                if t not in all_tags:
-                    all_tags.append(t)
+            lineage_tags.append(f"parent:{self._parent_session_id}")
 
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
@@ -2135,7 +1829,7 @@ class HindsightMemoryProvider(MemoryProvider):
             turn_index=self._turn_index,
         )
         num_turns = len(self._session_turns)
-        document_id, update_mode = self._resolve_retain_target(self._document_id)
+        document_id = self._document_id
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
@@ -2145,14 +1839,12 @@ class HindsightMemoryProvider(MemoryProvider):
                 content,
                 context=retain_context,
                 metadata=metadata_snapshot,
-                tags=all_tags or None,
+                tags=lineage_tags or None,
             )
             item.pop("bank_id", None)
             item.pop("retain_async", None)
-            if update_mode is not None:
-                item["update_mode"] = update_mode
-            logger.debug("Hindsight retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
-                         bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns)
+            logger.debug("Hindsight retain: bank=%s, doc=%s, async=%s, content_len=%d, num_turns=%d",
+                         bank_id, document_id, retain_async_flag, len(content), num_turns)
             self._run_hindsight_operation(
                 lambda client: client.aretain_batch(
                     bank_id=bank_id,
@@ -2183,13 +1875,6 @@ class HindsightMemoryProvider(MemoryProvider):
             user_tags = list(args.get("tags") or [])
             if scene_tag and scene_tag not in user_tags:
                 user_tags.append(scene_tag)
-
-            # P3.1: Auto-infer AMAP entity tags from content
-            if not"--no-auto-entity" in (args.get("tags") or []):
-                auto_entity_tags = self._infer_entity_tags_from_content(content)
-                for t in auto_entity_tags:
-                    if t not in user_tags:
-                        user_tags.append(t)
 
             # Parse entity/relation tags for associative memory
             parsed = self._parse_entity_tags(user_tags)
@@ -2322,6 +2007,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._session_turns:
             old_turns = list(self._session_turns)
             old_session_id = self._session_id
+            old_document_id = self._document_id
             old_parent_session_id = self._parent_session_id
             old_turn_index = self._turn_index
             old_metadata = self._build_metadata(
@@ -2334,13 +2020,6 @@ class HindsightMemoryProvider(MemoryProvider):
             if old_parent_session_id:
                 old_lineage_tags.append(f"parent:{old_parent_session_id}")
             old_content = "[" + ",".join(old_turns) + "]"
-            # Resolve doc_id + update_mode against the OLD session BEFORE
-            # we rotate _session_id, so the flush lands in the old
-            # session's document either way (legacy: per-process unique;
-            # ≥0.5.0: stable session-scoped + append).
-            old_document_id, old_update_mode = self._resolve_retain_target(
-                self._document_id
-            )
 
             def _flush():
                 try:
@@ -2352,11 +2031,9 @@ class HindsightMemoryProvider(MemoryProvider):
                     )
                     item.pop("bank_id", None)
                     item.pop("retain_async", None)
-                    if old_update_mode is not None:
-                        item["update_mode"] = old_update_mode
                     logger.debug(
-                        "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
-                        self._bank_id, old_document_id, old_update_mode, len(old_turns),
+                        "Hindsight flush-on-switch: bank=%s, doc=%s, num_turns=%d",
+                        self._bank_id, old_document_id, len(old_turns),
                     )
                     self._run_hindsight_operation(
                         lambda client: client.aretain_batch(
@@ -2448,11 +2125,6 @@ class HindsightMemoryProvider(MemoryProvider):
             all_tags = ["session-summary"] + lineage_tags
             if scene_tag and scene_tag not in all_tags:
                 all_tags.append(scene_tag)
-            # P3.2: Auto-infer AMAP entity tags from session summary
-            auto_entity_tags = self._infer_entity_tags_from_content(summary)
-            for t in auto_entity_tags:
-                if t not in all_tags:
-                    all_tags.append(t)
             retain_kwargs = self._build_retain_kwargs(
                 summary,
                 context="auto-session-summary",

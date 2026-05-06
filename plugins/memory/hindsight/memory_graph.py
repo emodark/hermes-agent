@@ -68,7 +68,6 @@ class MemoryGraph:
             text = mem.get("text", "") or mem.get("content", "") or ""
             tags = mem.get("tags", []) or []
 
-            entities_in_mem = []
             current_entity = None
             current_etype = None
             relations = []
@@ -79,7 +78,6 @@ class MemoryGraph:
                 if m:
                     current_entity = f"entity|{m.group(1)}:{m.group(2)}"
                     current_etype = m.group(1)
-                    entities_in_mem.append(current_entity)
                     continue
                 m = relation_re.match(tag_s)
                 if m:
@@ -89,10 +87,6 @@ class MemoryGraph:
                 # 记录节点类型
                 self.node_types[current_entity] = current_etype or "unknown"
 
-                # 确保节点在图中有记录（即使无边）
-                if current_entity not in self.graph:
-                    self.graph[current_entity] = []
-
                 # 记录节点关联的上下文(最多3条)
                 if text and len(self.node_context[current_entity]) < 3:
                     self.node_context[current_entity].append(text[:200])
@@ -100,18 +94,8 @@ class MemoryGraph:
                 # 建边: entity → relation target
                 for prefix, target in relations:
                     target_node = f"entity|{prefix}:{target}"
+                    # 权重: 相同 prefix 累加
                     self._add_edge(current_entity, target_node, 1.0, prefix)
-
-            # 同一条记忆中同时出现的实体 → 建立共现边
-            if len(entities_in_mem) > 1:
-                for i in range(len(entities_in_mem)):
-                    for j in range(i + 1, len(entities_in_mem)):
-                        self._add_edge(
-                            entities_in_mem[i], entities_in_mem[j],
-                            0.5, "co_occur")
-                        self._add_edge(
-                            entities_in_mem[j], entities_in_mem[i],
-                            0.5, "co_occur")
 
         self._built_at = time.time()
         logger.debug("MemoryGraph: built %d nodes, %d edges",
@@ -168,12 +152,11 @@ class MemoryGraph:
                 # 从邻接节点传播过来
                 propagate = 0.0
                 neighbors = self.graph.get(node, [])
-                if neighbors:
-                    for neighbor, weight, _ in neighbors:
-                        # 获取邻居的度(出度)
-                        out_degree = len(self.graph.get(neighbor, []))
-                        if out_degree > 0:
-                            propagate += (1.0 - alpha) * scores.get(neighbor, 0.0) * weight / out_degree
+                for neighbor, weight, _ in neighbors:
+                    # 获取邻居的度(出度)
+                    out_degree = len(self.graph.get(neighbor, []))
+                    if out_degree > 0:
+                        propagate += (1.0 - alpha) * scores.get(neighbor, 0.0) * weight / out_degree
 
                 new_scores[node] = restart + propagate
 
