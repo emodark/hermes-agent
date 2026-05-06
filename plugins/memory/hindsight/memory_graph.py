@@ -261,3 +261,68 @@ class MemoryGraph:
             "built_at": self._built_at,
             "age_seconds": time.time() - self._built_at if self._built_at else -1,
         }
+
+    def discover_routes(self, min_degree: int = 2) -> list[dict]:
+        """从 graph 分析自动发现推荐的路由规则。
+
+        对每个 entity|object:xxx / entity|concept:xxx 节点：
+        1. 按度数(连接的边数)排序，度数高=重要性高
+        2. 从关联的文本中提取关键词
+        3. 产出推荐路由
+
+        Returns:
+            [{keyword, entity, score}, ...] 按 score 降序
+        """
+        # 计算每个节点的度数
+        node_degree: dict[str, int] = {}
+        for src, neighbors in self.graph.items():
+            node_degree[src] = node_degree.get(src, 0) + len(neighbors)
+            for dst, _, _ in neighbors:
+                node_degree[dst] = node_degree.get(dst, 0) + 1
+
+        # 过滤出 entity|object: 和 entity|concept: 类型
+        routes = []
+        for node, degree in sorted(node_degree.items(), key=lambda x: -x[1]):
+            if not (node.startswith("entity|object:") or node.startswith("entity|concept:")):
+                continue
+            if degree < min_degree:
+                continue
+
+            entity_name = node.split(":", 1)[1] if ":" in node else node
+
+            # 从关联文本中提取关键词
+            keywords = set()
+            for text in self.node_context.get(node, []):
+                # 提取中文词组(2-6字)
+                cn_words = re.findall(r'[\u4e00-\u9fff]{2,6}', text)
+                keywords.update(cn_words[:3])  # 每条文本最多取3个
+                # 提取英文术语(含下划线/连字符)
+                en_terms = re.findall(r'[a-zA-Z_][a-zA-Z_0-9-]{2,}', text)
+                keywords.update(en_terms[:2])
+
+            # 过滤掉太泛的关键词
+            stop_words = {"this", "that", "the", "and", "for", "with",
+                          "from", "were", "has", "been", "用户", "一个",
+                          "没有", "可以", "进行", "通过", "使用"}
+            keywords = {k for k in keywords if k.lower() not in stop_words and len(k) >= 2}
+
+            for kw in keywords:
+                score = min(1.0, degree / 20.0)  # 度数越高，推荐分数越高
+                routes.append({
+                    "keyword": kw,
+                    "entity": node,
+                    "entity_name": entity_name,
+                    "score": round(score, 3),
+                    "degree": degree,
+                })
+
+        # 去重：相同 keyword+entity 只保留最高分
+        seen: set = set()
+        unique = []
+        for r in sorted(routes, key=lambda x: -x["score"]):
+            key = (r["keyword"], r["entity"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+
+        return unique[:50]  # 最多返回50条

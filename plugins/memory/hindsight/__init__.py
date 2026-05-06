@@ -1039,6 +1039,9 @@ class HindsightMemoryProvider(MemoryProvider):
         "元知识": "entity|concept:meta_knowledge",
         "负债表": "entity|object:balance_sheet",
     }
+    # Dynamic routes discovered from memory graph (auto-expanded)
+    _AMAP_DYNAMIC_ROUTES: dict[str, str] = {}
+    _AMAP_DYNAMIC_PREFETCH_COUNT = 0
 
     # Auto-tag keywords: content keywords → entity tag for retain auto-labeling
     _AMAP_ENTITY_KEYWORDS = {
@@ -1105,13 +1108,50 @@ class HindsightMemoryProvider(MemoryProvider):
             return []
 
     def _try_amap_match(self, query: str) -> str | None:
-        """Check CORE memory AMAP routes. Returns entity name if matched."""
+        """Check CORE memory AMAP routes + dynamic routes. Returns entity name if matched."""
         query_lower = query.lower()
+        # 先查静态路由
         for keyword, entity in self._AMAP_ROUTES.items():
             if keyword.lower() in query_lower:
                 logger.debug("AMAP matched: '%s' → %s", keyword, entity)
                 return entity
+        # 再查动态路由
+        if self._AMAP_DYNAMIC_ROUTES:
+            for keyword, entity in self._AMAP_DYNAMIC_ROUTES.items():
+                if keyword.lower() in query_lower:
+                    logger.debug("AMAP dynamic matched: '%s' → %s", keyword, entity)
+                    return entity
         return None
+
+    def _update_amap_routes(self) -> int:
+        """从 memory graph 自动发现路由，更新 _AMAP_DYNAMIC_ROUTES。
+
+        每10次 prefetch 调用一次，不阻塞。
+        Returns:
+            新增路由数
+        """
+        try:
+            self._memory_graph.build_from_hindsight()
+            routes = self._memory_graph.discover_routes(min_degree=2)
+            if not routes:
+                return 0
+
+            # 转成 keyword→entity dict，相同 keyword 取最高分
+            new_routes: dict[str, str] = {}
+            for r in routes:
+                kw = r["keyword"]
+                if kw not in new_routes:
+                    new_routes[kw] = r["entity"]
+
+            old_count = len(self._AMAP_DYNAMIC_ROUTES)
+            self._AMAP_DYNAMIC_ROUTES = new_routes
+            added = len(new_routes) - (old_count if old_count > 0 else 0)
+            logger.debug("AMAP dynamic routes updated: %d total, %d new",
+                         len(new_routes), added)
+            return max(0, added)
+        except Exception as e:
+            logger.debug("AMAP route discovery failed: %s", e)
+            return 0
 
     @staticmethod
     def _get_allowed_paths(mode: str) -> set:
@@ -1633,6 +1673,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 # ── PPR 图扩散扩展 ──
                 if self._prefetch_method != "reflect":
                     try:
+                        # 每10次 prefetch 刷新一次动态路由
+                        self._AMAP_DYNAMIC_PREFETCH_COUNT += 1
+                        if self._AMAP_DYNAMIC_PREFETCH_COUNT % 10 == 0:
+                            self._update_amap_routes()
+
                         # Build seed nodes from AMAP + recall results
                         seed_nodes = []
                         amap_entity = self._try_amap_match(query)
