@@ -44,7 +44,6 @@ from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
-from .memory_graph import MemoryGraph
 
 logger = logging.getLogger(__name__)
 
@@ -491,7 +490,6 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = True
-        self._memory_graph = MemoryGraph()
         self._recall_max_tokens = 4096
         self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
@@ -1602,52 +1600,24 @@ class HindsightMemoryProvider(MemoryProvider):
                     scored = self._rerank_with_time_decay(resp.results or [])
                     text = "\n".join(f"- {s[3]}" for s in scored) if scored else ""
 
-                # ── PPR 图扩散扩展 ──
+                # ── AMAP 扩展：如果查询命中路由表，加标签召回 ──
                 if self._prefetch_method != "reflect":
                     try:
-                        # Build seed nodes from AMAP + recall results
-                        seed_nodes = []
                         amap_entity = self._try_amap_match(query)
                         if amap_entity:
-                            seed_nodes.append(amap_entity)
-
-                        # 从语义召回结果中提取 entity 标签作为种子
-                        if resp and resp.results:
-                            for r in resp.results[:5]:
-                                for tag in (getattr(r, 'tags', None) or []):
-                                    ts = str(tag)
-                                    if ts.startswith("entity|"):
-                                        if ts not in seed_nodes:
-                                            seed_nodes.append(ts)
-
-                        if seed_nodes:
-                            # 构建/刷新图
-                            n_nodes = self._memory_graph.build_from_hindsight()
-                            logger.debug("Prefetch PPR: graph has %d nodes, seeds=%s",
-                                         n_nodes, seed_nodes[:3])
-
-                            # PPR 扩散
-                            expanded = self._memory_graph.get_expanded_nodes(
-                                seed_nodes, top_k=5, min_score=0.005)
-
-                            if expanded:
-                                extra_lines = []
-                                for node, score in expanded:
-                                    tag_results = self._tag_recall(node, limit=2)
-                                    for r in tag_results:
-                                        if r.text:
-                                            extra_lines.append(
-                                                f"- [关联:{score:.2f}] {r.text}")
+                            logger.debug("Prefetch expand[AMAP]: routing to %s", amap_entity)
+                            extra = self._tag_recall(amap_entity, limit=5, query=query)
+                            if extra:
+                                extra_lines = [f"- {r.text}" for r in extra if r.text]
                                 if extra_lines:
-                                    extra_text = "\n".join(extra_lines[:8])
+                                    extra_text = "\n".join(extra_lines)
                                     if text:
-                                        text = text + "\n# 联想记忆扩展\n" + extra_text
+                                        text = text + "\n" + extra_text
                                     else:
-                                        text = "# 联想记忆扩展\n" + extra_text
-                                    logger.debug("Prefetch PPR: added %d expanded memories",
-                                                 len(extra_lines))
-                    except Exception as ppr_e:
-                        logger.debug("Prefetch PPR expand failed: %s", ppr_e, exc_info=True)
+                                        text = extra_text
+                                    logger.debug("Prefetch expand: added %d AMAP results", len(extra_lines))
+                    except Exception as amap_e:
+                        logger.debug("Prefetch expand[AMAP] failed: %s", amap_e, exc_info=True)
 
                 if text:
                     with self._prefetch_lock:
