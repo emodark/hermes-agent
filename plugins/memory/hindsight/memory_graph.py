@@ -218,6 +218,12 @@ class MemoryGraph:
         seed_set = set(seed_nodes)
         results = [(n, s) for n, s in scores.items()
                    if n not in seed_set and s >= min_score]
+
+        # 如果图太稀疏(PPR没有扩散到其他节点)，回退到全量其他节点
+        if not results and len(self.graph) > len(seed_set) + 1:
+            logger.debug("PPR: graph too sparse, falling back to all other nodes")
+            fallback = [(n, 0.01) for n in self.graph if n not in seed_set]
+            results = fallback[:top_k]
         return results[:top_k]
 
     def _add_edge(self, src: str, dst: str, weight: float = 1.0,
