@@ -1054,6 +1054,25 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("_basic_recall failed: %s", e)
             return []
 
+    def _tag_recall(self, tag: str, limit: int = 5, query: str = "") -> list:
+        """Tag-exact recall via tag_groups filter.
+
+        Uses hindsight API's tag_groups parameter for exact tag match,
+        unlike _basic_recall which does semantic vector search.
+        """
+        recall_kwargs: dict = {
+            "bank_id": self._bank_id, "query": query or "",
+            "budget": "low", "max_tokens": self._recall_max_tokens,
+            "tag_groups": [{"tags": [tag]}],
+        }
+        try:
+            resp = self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs))
+            return list(resp.results) if resp and resp.results else []
+        except Exception as e:
+            logger.debug("_tag_recall failed for tag=%s: %s", tag, e)
+            return []
+
     def _try_amap_match(self, query: str) -> str | None:
         """Check CORE memory AMAP routes. Returns entity name if matched."""
         query_lower = query.lower()
@@ -1156,7 +1175,7 @@ class HindsightMemoryProvider(MemoryProvider):
             amap_entity = self._try_amap_match(query)
             if amap_entity:
                 logger.debug("Recall expand[AMAP]: routing to %s", amap_entity)
-                amap_results = self._basic_recall(amap_entity, limit=5)
+                amap_results = self._tag_recall(amap_entity, limit=5)
                 results.extend(amap_results)
 
         # Step 3: Extract entities from 1st-hop results
@@ -1175,7 +1194,7 @@ class HindsightMemoryProvider(MemoryProvider):
             for entity_name, entity_info in entities.items():
                 for rel in entity_info.get("relations", []):
                     if rel["prefix"] in allowed_prefixes:
-                        related = self._basic_recall(rel["target"], limit=3)
+                        related = self._tag_recall(rel["target"], limit=3)
                         for r in related:
                             if r not in expanded:
                                 expanded.append(r)
@@ -1579,6 +1598,26 @@ class HindsightMemoryProvider(MemoryProvider):
                     # 艾宾浩斯时间衰减重排序
                     scored = self._rerank_with_time_decay(resp.results or [])
                     text = "\n".join(f"- {s[3]}" for s in scored) if scored else ""
+
+                # ── AMAP 扩展：如果查询命中路由表，加标签召回 ──
+                if self._prefetch_method != "reflect":
+                    try:
+                        amap_entity = self._try_amap_match(query)
+                        if amap_entity:
+                            logger.debug("Prefetch expand[AMAP]: routing to %s", amap_entity)
+                            extra = self._tag_recall(amap_entity, limit=5, query=query)
+                            if extra:
+                                extra_lines = [f"- {r.text}" for r in extra if r.text]
+                                if extra_lines:
+                                    extra_text = "\n".join(extra_lines)
+                                    if text:
+                                        text = text + "\n" + extra_text
+                                    else:
+                                        text = extra_text
+                                    logger.debug("Prefetch expand: added %d AMAP results", len(extra_lines))
+                    except Exception as amap_e:
+                        logger.debug("Prefetch expand[AMAP] failed: %s", amap_e, exc_info=True)
+
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
