@@ -483,11 +483,14 @@ def memory_tool(
     # ── Auto-convert: full text → pointer format ────────────────────────
     # If content doesn't match [TIER]... | → h:... format, auto-store the
     # full content to hindsight and convert to pointer.
+    # Exception: if pointer is → h:auto (placeholder without real hindsight
+    # backing), still force-store so the content is indexable by graph diffusion.
     if target == "memory" and action in ("add", "replace") and content:
         content_stripped = content.strip()
         has_tier = content_stripped.startswith(("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"))
         has_pointer = "→ h:" in content_stripped
-        if not (has_tier and has_pointer):
+        has_auto_pointer = "→ h:auto" in content_stripped
+        if not (has_tier and has_pointer) or has_auto_pointer:
             # Auto-store to hindsight, convert content to pointer format
             import hashlib, logging as log_mod, subprocess
             log = log_mod.getLogger(__name__)
@@ -499,7 +502,14 @@ def memory_tool(
                     if brief.startswith(tag):
                         brief = brief[len(tag):].lstrip()
                         break
-            auto_tier = "STM"
+            # Preserve original tier, default to STM for new entries
+            original_tier = None
+            if has_tier:
+                for tag in ("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"):
+                    if content_stripped.startswith(tag):
+                        original_tier = tag
+                        break
+            auto_tier = original_tier if original_tier else "STM"
             pointer_entry = f"[{auto_tier}] {brief} | → h:{hindsight_key}"
             log.info("Auto-convert memory → pointer: %s (hindsight_key=%s)", brief, hindsight_key)
 
