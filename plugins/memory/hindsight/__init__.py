@@ -952,6 +952,68 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client))
 
+    # ── Entity/Relation tag parsing for associative memory ─────────────────
+    _ENTITY_RE = re.compile(r'^entity\|(\w+):(.+)$')
+    _RELATION_RE = re.compile(r'^relation\|(\w+):(.+)$')
+    _ATTR_RE = re.compile(r'^(\w[\w.]*):(.+)$')
+
+    def _parse_entity_tags(self, tags: list[str]) -> dict:
+        """Parse entity|type:name and relation|prefix:target format tags.
+
+        Args:
+            tags: Raw tag strings like ["entity|object:weekly_recommend",
+                  "obj.state:current", "relation|depend:market_scan"]
+
+        Returns:
+            {"entities": [{"type": str, "name": str, "raw": str}, ...],
+             "relations": [{"prefix": str, "target": str, "raw": str}, ...],
+             "attributes": {"key": "value", ...},
+             "descriptive": [str, ...]}  # unparseable tags
+        """
+        result: dict = {
+            "entities": [],
+            "relations": [],
+            "attributes": {},
+            "descriptive": [],
+        }
+        if not tags:
+            return result
+
+        for tag in tags:
+            tag = tag.strip()
+            m = self._ENTITY_RE.match(tag)
+            if m:
+                result["entities"].append({
+                    "type": m.group(1),
+                    "name": m.group(2),
+                    "raw": tag,
+                })
+                continue
+
+            m = self._RELATION_RE.match(tag)
+            if m:
+                result["relations"].append({
+                    "prefix": m.group(1),
+                    "target": m.group(2),
+                    "raw": tag,
+                })
+                continue
+
+            m = self._ATTR_RE.match(tag)
+            if m and not tag.startswith(("[", "→", "entity", "relation")):
+                result["attributes"][m.group(1)] = m.group(2)
+                continue
+
+            result["descriptive"].append(tag)
+
+        if result["entities"] or result["relations"]:
+            logger.debug(
+                "Parsed entity tags: %d entities, %d relations, %d attrs",
+                len(result["entities"]), len(result["relations"]),
+                len(result["attributes"]),
+            )
+        return result
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
@@ -1463,6 +1525,16 @@ class HindsightMemoryProvider(MemoryProvider):
             user_tags = list(args.get("tags") or [])
             if scene_tag and scene_tag not in user_tags:
                 user_tags.append(scene_tag)
+
+            # Parse entity/relation tags for associative memory
+            parsed = self._parse_entity_tags(user_tags)
+            if parsed["entities"] or parsed["relations"]:
+                logger.debug(
+                    "Entity-aware retain: entities=%s, relations=%s",
+                    [e["name"] for e in parsed["entities"]],
+                    [r["target"] for r in parsed["relations"]],
+                )
+
             try:
                 retain_kwargs = self._build_retain_kwargs(
                     content,
