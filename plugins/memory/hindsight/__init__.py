@@ -1039,6 +1039,34 @@ class HindsightMemoryProvider(MemoryProvider):
         "负债表": "entity|object:balance_sheet",
     }
 
+    # Auto-tag keywords: content keywords → entity tag for retain auto-labeling
+    _AMAP_ENTITY_KEYWORDS = {
+        "entity|object:weekly_recommend": ["每周推荐", "weekly_recommend", "周度分析", "市场扫描"],
+        "entity|object:data_pipeline": ["数据层", "data_pipeline", "K线存储", "指标计算", "kline_storage"],
+        "entity|object:ichimoku_fix": ["一目均衡", "ichimoku", "云图", "cloud", "ichimoku_cloud"],
+        "entity|object:holding_analysis": ["持仓", "holding", "position", "仓位", "持仓分析"],
+        "entity|object:jin10_data": ["金十", "jin10", "快讯", "宏观数据", "经济日历", "macro"],
+        "entity|concept:meta_knowledge": ["元知识", "六步法", "meta_knowledge", "思维模型", "推理链"],
+        "entity|object:balance_sheet": ["负债表", "balance_sheet", "财务数据", "财报"],
+        "entity|object:ecc_system": ["ECC", "本能系统", "置信度", "confid", "instinct"],
+    }
+
+    @staticmethod
+    def _infer_entity_tags_from_content(content: str) -> list[str]:
+        """Auto-infer AMAP entity tags from content keywords."""
+        if not content:
+            return []
+        content_lower = content.lower()
+        tags = []
+        for entity_tag, keywords in type.__dict__.get(
+                "_AMAP_ENTITY_KEYWORDS",
+                HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS).items():
+            for kw in keywords:
+                if kw.lower() in content_lower:
+                    tags.append(entity_tag)
+                    break
+        return tags
+
     def _basic_recall(self, query: str, limit: int = 10) -> list:
         """Core recall call, returns raw results without expansion."""
         recall_kwargs: dict = {
@@ -1875,6 +1903,13 @@ class HindsightMemoryProvider(MemoryProvider):
             if scene_tag and scene_tag not in user_tags:
                 user_tags.append(scene_tag)
 
+            # P3.1: Auto-infer AMAP entity tags from content
+            if not"--no-auto-entity" in (args.get("tags") or []):
+                auto_entity_tags = self._infer_entity_tags_from_content(content)
+                for t in auto_entity_tags:
+                    if t not in user_tags:
+                        user_tags.append(t)
+
             # Parse entity/relation tags for associative memory
             parsed = self._parse_entity_tags(user_tags)
             if parsed["entities"] or parsed["relations"]:
@@ -2124,6 +2159,11 @@ class HindsightMemoryProvider(MemoryProvider):
             all_tags = ["session-summary"] + lineage_tags
             if scene_tag and scene_tag not in all_tags:
                 all_tags.append(scene_tag)
+            # P3.2: Auto-infer AMAP entity tags from session summary
+            auto_entity_tags = self._infer_entity_tags_from_content(summary)
+            for t in auto_entity_tags:
+                if t not in all_tags:
+                    all_tags.append(t)
             retain_kwargs = self._build_retain_kwargs(
                 summary,
                 context="auto-session-summary",
