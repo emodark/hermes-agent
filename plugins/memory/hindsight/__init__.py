@@ -1055,25 +1055,6 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("_basic_recall failed: %s", e)
             return []
 
-    def _tag_recall(self, tag: str, limit: int = 5, query: str = "") -> list:
-        """Tag-exact recall via tag_groups filter.
-
-        Uses hindsight API's tag_groups parameter for exact tag match,
-        unlike _basic_recall which does semantic vector search.
-        """
-        recall_kwargs: dict = {
-            "bank_id": self._bank_id, "query": query or "",
-            "budget": "low", "max_tokens": self._recall_max_tokens,
-            "tag_groups": [{"tags": [tag]}],
-        }
-        try:
-            resp = self._run_hindsight_operation(
-                lambda client: client.arecall(**recall_kwargs))
-            return list(resp.results) if resp and resp.results else []
-        except Exception as e:
-            logger.debug("_tag_recall failed for tag=%s: %s", tag, e)
-            return []
-
     def _try_amap_match(self, query: str) -> str | None:
         """Check CORE memory AMAP routes. Returns entity name if matched."""
         query_lower = query.lower()
@@ -1176,7 +1157,7 @@ class HindsightMemoryProvider(MemoryProvider):
             amap_entity = self._try_amap_match(query)
             if amap_entity:
                 logger.debug("Recall expand[AMAP]: routing to %s", amap_entity)
-                amap_results = self._tag_recall(amap_entity, limit=5)
+                amap_results = self._basic_recall(amap_entity, limit=5)
                 results.extend(amap_results)
 
         # Step 3: Extract entities from 1st-hop results
@@ -1195,7 +1176,7 @@ class HindsightMemoryProvider(MemoryProvider):
             for entity_name, entity_info in entities.items():
                 for rel in entity_info.get("relations", []):
                     if rel["prefix"] in allowed_prefixes:
-                        related = self._tag_recall(rel["target"], limit=3)
+                        related = self._basic_recall(rel["target"], limit=3)
                         for r in related:
                             if r not in expanded:
                                 expanded.append(r)
@@ -1214,73 +1195,6 @@ class HindsightMemoryProvider(MemoryProvider):
         # Step 5: Merge, dedup, rank
         merged = self._merge_and_rank(results, expanded, max_results=max_results)
         return merged
-
-    @staticmethod
-    def _compress_results(results: list, mode: str = "task") -> str:
-        """Apply compression rules: type priority, dedup, truncation.
-
-        Priority: concept > current-object > recent-event > scene > past-object
-
-        Returns:
-            Formatted string with compressed results (max 15 items).
-        """
-        if not results:
-            return ""
-
-        # Type priority order (lower = higher priority)
-        type_priority = {
-            "concept": 0, "fact": 1, "object": 2, "event": 3,
-            "scene": 4, "process": 5, "meta": 6, "affect": 7, "env": 8,
-        }
-
-        # Dedup by entity tag (same entity = keep first/latest)
-        seen_entities: set = set()
-        seen_texts: set = set()
-        ranked: list = []
-
-        for r in results:
-            text = getattr(r, 'text', '') or ''
-            if isinstance(r, dict):
-                text = r.get('text', r.get('content', ''))
-            if not text or text in seen_texts:
-                continue
-            seen_texts.add(text)
-
-            tags = getattr(r, 'tags', None) or []
-            if isinstance(r, dict):
-                tags = r.get('tags', [])
-
-            # Find entity tag for dedup
-            entity_tag = None
-            best_priority = 50  # default low priority
-            for t in tags:
-                ts = str(t)
-                if ts.startswith("entity|"):
-                    entity_tag = ts
-                    parts = ts.split("|", 1)
-                    if len(parts) > 1:
-                        etype = parts[1].split(":")[0]
-                        best_priority = type_priority.get(etype, 50)
-                    break
-
-            if entity_tag:
-                if entity_tag in seen_entities:
-                    continue
-                seen_entities.add(entity_tag)
-
-            ranked.append((best_priority, text, r))
-
-        # Sort by priority
-        ranked.sort(key=lambda x: x[0])
-
-        # Format output
-        lines = []
-        for priority, text, r in ranked[:15]:
-            if len(text) > 300 and mode == "task":
-                text = text[:300] + "..."
-            lines.append(f"- {text}")
-
-        return "\n".join(lines)
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
@@ -1500,9 +1414,7 @@ class HindsightMemoryProvider(MemoryProvider):
             f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
             f"Relevant memories are automatically injected into context. "
             f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-            f"hindsight_retain to store facts.\n"
-            f"Recall supports mode='task' (default, focused) or mode='innovation' (broad associations). "
-            f"Set mode='innovation' for cross-domain discovery."
+            f"hindsight_retain to store facts."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -1599,26 +1511,6 @@ class HindsightMemoryProvider(MemoryProvider):
                     # 艾宾浩斯时间衰减重排序
                     scored = self._rerank_with_time_decay(resp.results or [])
                     text = "\n".join(f"- {s[3]}" for s in scored) if scored else ""
-
-                # ── AMAP 扩展：如果查询命中路由表，加标签召回 ──
-                if self._prefetch_method != "reflect":
-                    try:
-                        amap_entity = self._try_amap_match(query)
-                        if amap_entity:
-                            logger.debug("Prefetch expand[AMAP]: routing to %s", amap_entity)
-                            extra = self._tag_recall(amap_entity, limit=5, query=query)
-                            if extra:
-                                extra_lines = [f"- {r.text}" for r in extra if r.text]
-                                if extra_lines:
-                                    extra_text = "\n".join(extra_lines)
-                                    if text:
-                                        text = text + "\n" + extra_text
-                                    else:
-                                        text = extra_text
-                                    logger.debug("Prefetch expand: added %d AMAP results", len(extra_lines))
-                    except Exception as amap_e:
-                        logger.debug("Prefetch expand[AMAP] failed: %s", amap_e, exc_info=True)
-
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
@@ -1648,36 +1540,6 @@ class HindsightMemoryProvider(MemoryProvider):
                         logger.debug("Prefetch: appended %d session-summaries", len(s_lines))
             except Exception as e:
                 logger.debug("Session-summary prefetch failed: %s", e, exc_info=True)
-
-            # ── Also fetch recent entity-tagged memories for cross-session continuity ──
-            try:
-                entity_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": "",
-                    "budget": "low", "max_tokens": 1500,
-                    "tags": ["auto-memory"],
-                    "tags_match": "any",
-                }
-                e_resp = self._run_hindsight_operation(
-                    lambda client: client.arecall(**entity_kwargs)
-                )
-                if e_resp and e_resp.results:
-                    e_lines = []
-                    for r in e_resp.results[:5]:
-                        tags = r.tags or []
-                        for t in tags:
-                            if t.startswith("entity|") or t.startswith("relation|"):
-                                e_lines.append(f"• [{t}] {r.text[:80]}")
-                                break
-                    if e_lines:
-                        e_text = "\n".join(e_lines)
-                        with self._prefetch_lock:
-                            if self._prefetch_result:
-                                self._prefetch_result += "\n\n" + e_text
-                            else:
-                                self._prefetch_result = e_text
-                        logger.debug("Prefetch: appended %d entity-tagged memories", len(e_lines))
-            except Exception as e:
-                logger.debug("Entity-tagged prefetch failed: %s", e, exc_info=True)
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
