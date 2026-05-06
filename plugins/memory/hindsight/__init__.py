@@ -164,23 +164,13 @@ RETAIN_SCHEMA = {
 RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
-        "Search long-term memory with multi-hop association expansion. "
-        "Returns memories ranked by relevance using semantic search, "
-        "keyword matching, entity graph traversal, and reranking."
+        "Search long-term memory. Returns memories ranked by relevance using "
+        "semantic search, keyword matching, entity graph traversal, and reranking."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
-            "mode": {
-                "type": "string",
-                "enum": ["task", "innovation"],
-                "description": "'task' (default, strong relations only) or 'innovation' (include weak/novel associations)",
-            },
-            "hops": {
-                "type": "integer",
-                "description": "Number of expansion hops. 2 for task mode, 3 for innovation.",
-            },
         },
         "required": ["query"],
     },
@@ -1025,177 +1015,6 @@ class HindsightMemoryProvider(MemoryProvider):
             )
         return result
 
-    # ── Multi-hop graph expansion engine ──────────────────────────────────
-    # AMAP route table: keyword → entity mapping for associative routing
-    _AMAP_ROUTES = {
-        "每周推荐": "entity|object:weekly_recommend",
-        "数据": "entity|object:data_pipeline",
-        "一目均衡": "entity|object:ichimoku_fix",
-        "ECC": "entity|object:ecc_system",
-        "持仓": "entity|object:holding_analysis",
-        "金十": "entity|object:jin10_data",
-        "元知识": "entity|concept:meta_knowledge",
-        "负债表": "entity|object:balance_sheet",
-    }
-
-    def _basic_recall(self, query: str, limit: int = 10) -> list:
-        """Core recall call, returns raw results without expansion."""
-        recall_kwargs: dict = {
-            "bank_id": self._bank_id, "query": query,
-            "budget": self._budget, "max_tokens": self._recall_max_tokens,
-        }
-        if self._recall_tags:
-            recall_kwargs["tags"] = self._recall_tags
-            recall_kwargs["tags_match"] = self._recall_tags_match
-        try:
-            resp = self._run_hindsight_operation(
-                lambda client: client.arecall(**recall_kwargs))
-            return list(resp.results) if resp and resp.results else []
-        except Exception as e:
-            logger.debug("_basic_recall failed: %s", e)
-            return []
-
-    def _try_amap_match(self, query: str) -> str | None:
-        """Check CORE memory AMAP routes. Returns entity name if matched."""
-        query_lower = query.lower()
-        for keyword, entity in self._AMAP_ROUTES.items():
-            if keyword.lower() in query_lower:
-                logger.debug("AMAP matched: '%s' → %s", keyword, entity)
-                return entity
-        return None
-
-    @staticmethod
-    def _get_allowed_paths(mode: str) -> set:
-        """Get allowed relation path prefixes for the given mode."""
-        if mode == "task":
-            return {"depend", "guide", "contains"}
-        return {"impact", "suggest", "evolve", "cause", "depend", "guide", "contains"}
-
-    @staticmethod
-    def _extract_entities_from_results(results: list) -> dict:
-        """Extract entity|type:name and relation|prefix:target from recall results.
-
-        Scans each result's tags for entity/relation patterns.
-        Returns {entity_name: {type, relations: [{prefix, target}]}}
-        """
-        import re
-        entity_re = re.compile(r'^entity\|(\w+):(.+)$')
-        relation_re = re.compile(r'^relation\|(\w+):(.+)$')
-
-        entities: dict = {}
-        for r in results:
-            tags = getattr(r, 'tags', None) or []
-            if not tags:
-                # Try dict access
-                tags = r.get('tags', []) if isinstance(r, dict) else []
-            current_entity = None
-            current_relations = []
-            for tag in tags:
-                tag_s = str(tag)
-                m = entity_re.match(tag_s)
-                if m:
-                    current_entity = m.group(2)
-                    etype = m.group(1)
-                    if current_entity not in entities:
-                        entities[current_entity] = {"type": etype, "relations": []}
-                    continue
-                m = relation_re.match(tag_s)
-                if m:
-                    current_relations.append({
-                        "prefix": m.group(1),
-                        "target": m.group(2),
-                    })
-            if current_entity and current_relations and current_entity in entities:
-                entities[current_entity]["relations"].extend(current_relations)
-        return entities
-
-    @staticmethod
-    def _merge_and_rank(primary: list, expanded: list,
-                        max_results: int = 20) -> list:
-        """Merge primary + expanded results, dedup by text."""
-        seen_texts: set = set()
-        merged: list = []
-
-        def _get_text(item) -> str:
-            if hasattr(item, 'text'):
-                return item.text or ""
-            if isinstance(item, dict):
-                return item.get('text', item.get('content', ''))
-            return str(item)
-
-        for item in primary + expanded:
-            text = _get_text(item)
-            if text and text not in seen_texts:
-                seen_texts.add(text)
-                merged.append(item)
-                if len(merged) >= max_results:
-                    break
-        return merged
-
-    def _recall_with_expand(self, query: str, mode: str = "task",
-                            hops: int = 0, max_results: int = 20) -> list:
-        """Multi-hop graph expansion recall with mode switching.
-
-        Args:
-            query: User query string
-            mode: "task" (depend/guide/contains) or "innovation" (+impact/suggest)
-            hops: Expansion hops (0 = auto: task=2, innovation=3)
-            max_results: Max results to return
-
-        Returns:
-            List of memory dicts with expanded context
-        """
-        if hops <= 0:
-            hops = 2 if mode == "task" else 3
-
-        # Step 1: 1st hop - basic semantic recall
-        results = self._basic_recall(query, limit=min(10, max_results))
-        logger.debug("Recall expand[1st hop]: %d results for '%s'", len(results), query)
-
-        # Step 2: If few results, try AMAP route activation
-        if len(results) < 3:
-            amap_entity = self._try_amap_match(query)
-            if amap_entity:
-                logger.debug("Recall expand[AMAP]: routing to %s", amap_entity)
-                amap_results = self._basic_recall(amap_entity, limit=5)
-                results.extend(amap_results)
-
-        # Step 3: Extract entities from 1st-hop results
-        entities = self._extract_entities_from_results(results)
-        if not entities:
-            logger.debug("Recall expand: no entities found, returning 1st-hop results")
-            return results[:max_results]
-
-        # Step 4: Multi-hop expansion via relations
-        expanded: list = []
-        allowed_prefixes = self._get_allowed_paths(mode)
-        current_hops = min(hops - 1, 2)  # max 2 extra hops to avoid explosion
-
-        for _ in range(current_hops):
-            new_entities = {}
-            for entity_name, entity_info in entities.items():
-                for rel in entity_info.get("relations", []):
-                    if rel["prefix"] in allowed_prefixes:
-                        related = self._basic_recall(rel["target"], limit=3)
-                        for r in related:
-                            if r not in expanded:
-                                expanded.append(r)
-                        # Extract entities from related for next hop
-                        sub_entities = self._extract_entities_from_results(related)
-                        new_entities.update(sub_entities)
-
-            # Next hop uses newly discovered entities
-            if not new_entities:
-                break
-            entities = new_entities
-
-        logger.debug("Recall expand[expanded]: %d additional results from %d hops",
-                     len(expanded), current_hops)
-
-        # Step 5: Merge, dedup, rank
-        merged = self._merge_and_rank(results, expanded, max_results=max_results)
-        return merged
-
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
@@ -1736,39 +1555,30 @@ class HindsightMemoryProvider(MemoryProvider):
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
-            mode = args.get("mode", "task")
-            hops = args.get("hops", 0)
             try:
-                logger.debug("Tool hindsight_recall: query=%s, mode=%s, hops=%s",
-                             query[:80], mode, hops)
-                # Multi-hop graph expansion recall
-                results = self._recall_with_expand(
-                    query, mode=mode, hops=hops, max_results=20)
-
-                if not results:
+                recall_kwargs: dict = {
+                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
+                    "max_tokens": self._recall_max_tokens,
+                }
+                if self._recall_tags:
+                    recall_kwargs["tags"] = self._recall_tags
+                    recall_kwargs["tags_match"] = self._recall_tags_match
+                if self._recall_types:
+                    recall_kwargs["types"] = self._recall_types
+                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
+                             self._bank_id, len(query), self._budget)
+                resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+                num_results = len(resp.results) if resp.results else 0
+                logger.debug("Tool hindsight_recall: %d results", num_results)
+                if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-
                 # 艾宾浩斯时间衰减重排序
-                scored = self._rerank_with_time_decay(results)
+                scored = self._rerank_with_time_decay(resp.results)
                 lines = [f"{i}. {s[3]}" for i, s in enumerate(scored, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
-                logger.warning("hindsight_recall expand failed: %s", e, exc_info=True)
-                # Fallback: single-point recall
-                try:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                        "max_tokens": self._recall_max_tokens,
-                    }
-                    resp = self._run_hindsight_operation(
-                        lambda client: client.arecall(**recall_kwargs))
-                    if not resp.results:
-                        return json.dumps({"result": "No relevant memories found."})
-                    scored = self._rerank_with_time_decay(resp.results)
-                    lines = [f"{i}. {s[3]}" for i, s in enumerate(scored, 1)]
-                    return json.dumps({"result": "\n".join(lines)})
-                except Exception as e2:
-                    return tool_error(f"Failed to search memory: {e2}")
+                logger.warning("hindsight_recall failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to search memory: {e}")
 
         elif tool_name == "hindsight_reflect":
             query = args.get("query", "")

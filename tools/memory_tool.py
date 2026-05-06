@@ -48,71 +48,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# ── Hindsight 自动标签推断（与 hindsight plugin 保持同步）──────────────
-# 复制自 plugins/memory/hindsight/__init__.py，保持两处一致。
-# 修改关键词时两边同步更新。
-
-_SCENE_KEYWORDS = {
-    "stock":   ["股票", "K线", "涨停", "跌停", "ADX", "BOLL", "持仓", "买入", "卖出",
-                 "行情", "大盘", "板块", "仓位", "止损", "止盈", "均线", "成交量",
-                 "换手率", "趋势", "突破", "回调", "反弹", "支撑", "压力"],
-    "dev":     ["bug", "修复", "部署", "配置", "API", "skill", "MongoDB", "git",
-                 "错误", "报错", "调试", "代码", "函数", "类", "模块", "重构",
-                 "升级", "迁移", "版本", "commit", "push", "PR"],
-    "life":    ["猫", "福宝", "吃饭", "天气", "旅行", "日记", "生活", "个人",
-                 "德文", "宠物", "健康", "运动", "电影", "音乐"],
-    "project": ["方案", "计划", "设计", "架构", "路线图", "需求", "规划",
-                 "文档", "设计稿", "顶层设计", "流程图", "分析", "对比",
-                 "调研", "评审", "里程碑", "deadline"],
-    "trading": ["交易", "止损", "仓位", "预期", "目标价", "风报比",
-                 "加仓", "减仓", "清仓", "底仓", "做T", "回撤", "胜率",
-                 "盈亏比", "信号", "入场", "出场"],
-}
-
-_AMAP_ENTITY_KEYWORDS = {
-    "entity|object:weekly_recommend": ["每周推荐", "weekly_recommend", "周度分析", "市场扫描"],
-    "entity|object:data_pipeline": ["数据层", "data_pipeline", "K线存储", "指标计算", "kline_storage"],
-    "entity|object:ichimoku_fix": ["一目均衡", "ichimoku", "云图", "cloud", "ichimoku_cloud"],
-    "entity|object:holding_analysis": ["持仓", "holding", "position", "仓位", "持仓分析"],
-    "entity|object:jin10_data": ["金十", "jin10", "快讯", "宏观数据", "经济日历", "macro"],
-    "entity|concept:meta_knowledge": ["元知识", "六步法", "meta_knowledge", "思维模型", "推理链"],
-    "entity|object:balance_sheet": ["负债表", "balance_sheet", "财务数据", "财报"],
-    "entity|object:ecc_system": ["ECC", "本能系统", "置信度", "confid", "instinct"],
-}
-
-
-def _infer_scene_tag(content: str) -> str:
-    """从内容关键词自动推断场景标签（stock/dev/life/project/trading）。
-    与 hindsight plugin 的 HindsightMemoryProvider._infer_scene 保持同步。
-    """
-    if not content:
-        return ""
-    content_lower = content.lower()
-    scores = {}
-    for scene_name, keywords in _SCENE_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw.lower() in content_lower)
-        if score > 0:
-            scores[scene_name] = score
-    if not scores:
-        return ""
-    return max(scores, key=scores.get)
-
-
-def _infer_entity_tags(content: str) -> list[str]:
-    """从内容关键词自动推断 AMAP entity 标签。
-    与 hindsight plugin 的 HindsightMemoryProvider._infer_entity_tags_from_content 保持同步。
-    """
-    if not content:
-        return []
-    content_lower = content.lower()
-    tags = []
-    for entity_tag, keywords in _AMAP_ENTITY_KEYWORDS.items():
-        for kw in keywords:
-            if kw.lower() in content_lower:
-                tags.append(entity_tag)
-                break
-    return tags
-
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
@@ -548,14 +483,11 @@ def memory_tool(
     # ── Auto-convert: full text → pointer format ────────────────────────
     # If content doesn't match [TIER]... | → h:... format, auto-store the
     # full content to hindsight and convert to pointer.
-    # Exception: if pointer is → h:auto (placeholder without real hindsight
-    # backing), still force-store so the content is indexable by graph diffusion.
     if target == "memory" and action in ("add", "replace") and content:
         content_stripped = content.strip()
         has_tier = content_stripped.startswith(("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"))
         has_pointer = "→ h:" in content_stripped
-        has_auto_pointer = "→ h:auto" in content_stripped
-        if not (has_tier and has_pointer) or has_auto_pointer:
+        if not (has_tier and has_pointer):
             # Auto-store to hindsight, convert content to pointer format
             import hashlib, logging as log_mod, subprocess
             log = log_mod.getLogger(__name__)
@@ -567,43 +499,24 @@ def memory_tool(
                     if brief.startswith(tag):
                         brief = brief[len(tag):].lstrip()
                         break
-            # Preserve original tier, default to STM for new entries
-            original_tier = None
-            if has_tier:
-                for tag in ("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"):
-                    if content_stripped.startswith(tag):
-                        original_tier = tag
-                        break
-            auto_tier = original_tier if original_tier else "STM"
+            auto_tier = "STM"
             pointer_entry = f"[{auto_tier}] {brief} | → h:{hindsight_key}"
             log.info("Auto-convert memory → pointer: %s (hindsight_key=%s)", brief, hindsight_key)
 
             # Fire-and-forget hindsight retain
             try:
-                # Build tags: base + auto-inferred scene/entity + pass-through
+                # Build tags: base + entity/relation tags from content
                 extra_tags = ["auto-memory", f"key:{hindsight_key}"]
 
-                # P1: 自动推断场景标签（stock/dev/life/project/trading）
-                scene_tag = _infer_scene_tag(content_stripped)
-                if scene_tag and scene_tag not in extra_tags:
-                    extra_tags.append(scene_tag)
-
-                # P2: 自动推断 AMAP entity 标签（基于内容关键词匹配）
-                for entity_tag in _infer_entity_tags(content_stripped):
-                    if entity_tag not in extra_tags:
-                        extra_tags.append(entity_tag)
-
-                # P3: 内容含显式 [AMAP] 路由标记 → 透传实体标签
+                # If content contains AMAP routing entries, add entity tags
                 if "[AMAP]" in content_stripped:
-                    for tag in ("entity|concept:amap_routing",):
-                        if tag not in extra_tags:
-                            extra_tags.append(tag)
+                    extra_tags.append("entity|concept:amap_routing")
                     for line in content_stripped.split("\n"):
                         m = re.search(r'→\s*(entity\|\w+:\w+)', line)
-                        if m and m.group(1) not in extra_tags:
+                        if m:
                             extra_tags.append(m.group(1))
 
-                # P4: 内容含显式 entity|/relation| 标记 → 透传
+                # If content contains explicit entity| or relation| tags, pass through
                 if "entity|" in content_stripped or "relation|" in content_stripped:
                     for line in content_stripped.split("\n"):
                         line = line.strip()
