@@ -24,13 +24,10 @@ Design:
 """
 
 import json
-import hashlib
 import logging
 import os
 import re
-import subprocess
 import tempfile
-from datetime import datetime
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -50,6 +47,71 @@ except ImportError:
         pass
 
 logger = logging.getLogger(__name__)
+
+# ── Hindsight 自动标签推断（与 hindsight plugin 保持同步）──────────────
+# 复制自 plugins/memory/hindsight/__init__.py，保持两处一致。
+# 修改关键词时两边同步更新。
+
+_SCENE_KEYWORDS = {
+    "stock":   ["股票", "K线", "涨停", "跌停", "ADX", "BOLL", "持仓", "买入", "卖出",
+                 "行情", "大盘", "板块", "仓位", "止损", "止盈", "均线", "成交量",
+                 "换手率", "趋势", "突破", "回调", "反弹", "支撑", "压力"],
+    "dev":     ["bug", "修复", "部署", "配置", "API", "skill", "MongoDB", "git",
+                 "错误", "报错", "调试", "代码", "函数", "类", "模块", "重构",
+                 "升级", "迁移", "版本", "commit", "push", "PR"],
+    "life":    ["猫", "福宝", "吃饭", "天气", "旅行", "日记", "生活", "个人",
+                 "德文", "宠物", "健康", "运动", "电影", "音乐"],
+    "project": ["方案", "计划", "设计", "架构", "路线图", "需求", "规划",
+                 "文档", "设计稿", "顶层设计", "流程图", "分析", "对比",
+                 "调研", "评审", "里程碑", "deadline"],
+    "trading": ["交易", "止损", "仓位", "预期", "目标价", "风报比",
+                 "加仓", "减仓", "清仓", "底仓", "做T", "回撤", "胜率",
+                 "盈亏比", "信号", "入场", "出场"],
+}
+
+_AMAP_ENTITY_KEYWORDS = {
+    "entity|object:weekly_recommend": ["每周推荐", "weekly_recommend", "周度分析", "市场扫描"],
+    "entity|object:data_pipeline": ["数据层", "data_pipeline", "K线存储", "指标计算", "kline_storage"],
+    "entity|object:ichimoku_fix": ["一目均衡", "ichimoku", "云图", "cloud", "ichimoku_cloud"],
+    "entity|object:holding_analysis": ["持仓", "holding", "position", "仓位", "持仓分析"],
+    "entity|object:jin10_data": ["金十", "jin10", "快讯", "宏观数据", "经济日历", "macro"],
+    "entity|concept:meta_knowledge": ["元知识", "六步法", "meta_knowledge", "思维模型", "推理链"],
+    "entity|object:balance_sheet": ["负债表", "balance_sheet", "财务数据", "财报"],
+    "entity|object:ecc_system": ["ECC", "本能系统", "置信度", "confid", "instinct"],
+}
+
+
+def _infer_scene_tag(content: str) -> str:
+    """从内容关键词自动推断场景标签（stock/dev/life/project/trading）。
+    与 hindsight plugin 的 HindsightMemoryProvider._infer_scene 保持同步。
+    """
+    if not content:
+        return ""
+    content_lower = content.lower()
+    scores = {}
+    for scene_name, keywords in _SCENE_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw.lower() in content_lower)
+        if score > 0:
+            scores[scene_name] = score
+    if not scores:
+        return ""
+    return max(scores, key=scores.get)
+
+
+def _infer_entity_tags(content: str) -> list[str]:
+    """从内容关键词自动推断 AMAP entity 标签。
+    与 hindsight plugin 的 HindsightMemoryProvider._infer_entity_tags_from_content 保持同步。
+    """
+    if not content:
+        return []
+    content_lower = content.lower()
+    tags = []
+    for entity_tag, keywords in _AMAP_ENTITY_KEYWORDS.items():
+        for kw in keywords:
+            if kw.lower() in content_lower:
+                tags.append(entity_tag)
+                break
+    return tags
 
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
@@ -159,7 +221,10 @@ class MemoryStore:
             yield
             return
 
-        fd = open(lock_path, "a+", encoding="utf-8")
+        if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+            lock_path.write_text(" ", encoding="utf-8")
+
+        fd = open(lock_path, "r+" if msvcrt else "a+")
         try:
             if fcntl:
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -291,7 +356,7 @@ class MemoryStore:
 
             if len(matches) > 1:
                 # If all matches are identical (exact duplicates), operate on the first one
-                unique_texts = {e for _, e in matches}
+                unique_texts = set(e for _, e in matches)
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
                     return {
@@ -341,7 +406,7 @@ class MemoryStore:
 
             if len(matches) > 1:
                 # If all matches are identical (exact duplicates), remove the first one
-                unique_texts = {e for _, e in matches}
+                unique_texts = set(e for _, e in matches)
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
                     return {
@@ -462,153 +527,6 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
-def _extract_brief(text: str, max_chars: int = 40) -> str:
-    """Extract concise keyword pointer from content first line.
-
-    Rules in order:
-    1. Strip [TIER] or [[TIER]] tags
-    2. Strip date prefix YYYY-MM-DD, numbering ①②③ 1.
-    3. Colon split: take BEFORE (topic) if short <=20, else AFTER (content)
-    4. Separator split: take before （→——，。 (first match wins)
-    5. Space split: take first word (catches 'ChineseTopic detail' pattern)
-    6. Final truncation at max_chars
-    """
-    import re
-    line = text.split("\n")[0].strip()
-    # Strip tier tag [CORE] or [[CORE]]
-    for tag in ("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"):
-        if line.startswith(tag):
-            line = line[len(tag):].lstrip()
-            break
-        if line.startswith("[" + tag):  # [[CORE]]
-            line = line[len("[" + tag):]
-            if line.startswith("]"):
-                line = line[1:]
-            line = line.lstrip()
-            break
-    # Strip date prefix: YYYY-MM-DD or YYYY/MM/DD (with optional colon after)
-    line = re.sub(r'^\d{4}[-/]\d{2}[-/]\d{2}\s*:?\s*', '', line)
-    # Strip numbering: ①②③ or 1. 2. 3. or (1) (2)
-    line = re.sub(r'^[①②③④⑤⑥⑦⑧⑨⑩]\s*', '', line)
-    line = re.sub(r'^\(\d+\)\s*', '', line)
-    line = re.sub(r'^\d+[\.\、\)]\s*', '', line)
-    # Colon: pick BEFORE (topic label) if short, else AFTER (content)
-    colon_match = re.search(r'[：:]', line)
-    if colon_match:
-        colon_idx = colon_match.start()
-        before = line[:colon_idx].strip()
-        after = line[colon_idx+1:].strip()
-        # Take topic only if it's ≥4 chars OR contains Latin (acronym: ROE/PE/BOLL)
-        line = before if len(before) <= 20 and len(before) < len(after) and (
-            len(before) >= 4 or re.search(r'[a-zA-Z]', before)
-        ) else after
-    # Separator split: take before first meaningful break
-    if len(line) > 25:
-        for sep in ('（', '→', '——', '—', '，', '。'):
-            if sep in line:
-                parts = line.split(sep, 1)
-                if len(parts[0]) >= 2 and len(parts[0]) <= max_chars:
-                    line = parts[0]
-                    break
-        # Space split: short first word (<4, no Latin) → use second part
-        if len(line) > 25 and ' ' in line:
-            parts = line.split(' ', 1)
-            if len(parts[0]) >= 2 and len(parts[0]) <= max_chars:
-                if len(parts[0]) < 4 and not re.search(r'[a-zA-Z]', parts[0]):
-                    line = parts[1][:max_chars]
-                else:
-                    line = parts[0]
-    return line[:max_chars].strip()
-
-
-def _extract_summary(text: str, max_chars: int = 200) -> str:
-    """从完整原文提取结构化摘要。
-
-    策略：
-    1. 如果 text 短于 max_chars → 原样返回
-    2. 按行扫描，找含'结论'/'确认'/'决定'/'方案'/冒号等关键信息的行
-    3. 取最多3个关键行，用 ；拼接
-    4. 如果还是太长 → 取第一个非空段
-    5. 最后截断到 max_chars-3 + '...'
-    """
-    text = text.strip()
-    if not text:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    import re
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    # 策略1：取含关键信息的行（结论/决定/包含冒号的技术描述）
-    key_lines = []
-    for line in lines:
-        # 跳过纯标点/装饰行
-        if re.match(r'^[═\-—=#*▶▸→\s]+$', line):
-            continue
-        # 含关键指示词的行优先
-        if any(kw in line for kw in ['结论', '结果', '确认', '决定', '方案',
-                                      '修复', '改为', '设置', '配置',
-                                      '策略', '规则', '原则', '偏好',
-                                      '注意', '风险', '问题', '原因']):
-            key_lines.append(line)
-        elif any(kw in line for kw in ['：', ':']) and len(line) > 5:
-            key_lines.append(line)
-    if key_lines:
-        summary = '；'.join(key_lines[:3])
-        if len(summary) <= max_chars:
-            return summary
-    # 策略2：取第一个有意义的段落
-    for line in lines:
-        if len(line) > 10 and not re.match(r'^[═\-—=#*▶▸→\s]+$', line):
-            if len(line) <= max_chars:
-                return line
-            return line[:max_chars-3] + '...'
-    return text[:max_chars-3] + '...'
-
-
-def _write_obsidian_raw(content: str, tag: str, hindsight_key: str) -> str:
-    """将完整原文写入 wiki/obsidian vault。返回相对路径。
-
-    路径格式: agent-memory/raw/YYYY-MM-DD/{hindsight_key}.md
-    文件内容: YAML frontmatter + 原文
-    """
-    import os as _os, tempfile
-    from datetime import date
-
-    today = date.today().isoformat()
-    vault = _os.environ.get('OBSIDIAN_VAULT_PATH', _os.path.expanduser('~/wiki'))
-
-    dir_path = _os.path.join(vault, 'agent-memory', 'raw', today)
-    _os.makedirs(dir_path, exist_ok=True)
-
-    file_path = _os.path.join(dir_path, f'{hindsight_key}.md')
-
-    obsidian_content = f"""---
-type: memory_raw
-date: {today}
-hash: {hindsight_key}
-tags: [{tag}]
----
-
-{content}
-"""
-    # 原子写入
-    fd, tmp = tempfile.mkstemp(dir=dir_path, suffix='.tmp', prefix='.mem_')
-    try:
-        with _os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(obsidian_content)
-            f.flush()
-            _os.fsync(f.fileno())
-        _os.replace(tmp, file_path)
-    except BaseException:
-        try:
-            _os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-    return f'agent-memory/raw/{today}/{hindsight_key}.md'
-
-
 def memory_tool(
     action: str,
     target: str = "memory",
@@ -624,180 +542,99 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in {"memory", "user"}:
+    if target not in ("memory", "user"):
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
     # ── Auto-convert: full text → pointer format ────────────────────────
-    # [CORE] 规则 → 直接写 MEMORY.md，不走 hindsight
-    # 其他内容 → 存 hindsight + 写指针到 recent_macro.md，跳过 MEMORY.md
+    # If content doesn't match [TIER]... | → h:... format, auto-store the
+    # full content to hindsight and convert to pointer.
+    # Exception: if pointer is → h:auto (placeholder without real hindsight
+    # backing), still force-store so the content is indexable by graph diffusion.
     if target == "memory" and action in ("add", "replace") and content:
         content_stripped = content.strip()
-        is_core_rule = content_stripped.startswith("[CORE]")
+        has_tier = content_stripped.startswith(("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"))
+        has_pointer = "→ h:" in content_stripped
+        has_auto_pointer = "→ h:auto" in content_stripped
+        if not (has_tier and has_pointer) or has_auto_pointer:
+            # Auto-store to hindsight, convert content to pointer format
+            import hashlib, logging as log_mod, subprocess
+            log = log_mod.getLogger(__name__)
+            hindsight_key = "auto_" + hashlib.md5(content.encode()).hexdigest()[:12]
+            brief = content_stripped.split("\n")[0][:60]
+            # Strip existing tier tag if present (auto-convert normalizes to [STM])
+            if has_tier:
+                for tag in ("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"):
+                    if brief.startswith(tag):
+                        brief = brief[len(tag):].lstrip()
+                        break
+            # Preserve original tier, default to STM for new entries
+            original_tier = None
+            if has_tier:
+                for tag in ("[CORE]", "[LTM]", "[STM]", "[WM]", "[ELIM]"):
+                    if content_stripped.startswith(tag):
+                        original_tier = tag
+                        break
+            auto_tier = original_tier if original_tier else "STM"
+            pointer_entry = f"[{auto_tier}] {brief} | → h:{hindsight_key}"
+            log.info("Auto-convert memory → pointer: %s (hindsight_key=%s)", brief, hindsight_key)
 
-        if is_core_rule:
-            # [CORE] 规则直接写 MEMORY.md，不存 hindsight，不建指针
-            logger.info("Memory: [CORE] rule saved directly to MEMORY.md")
-        else:
-            has_tier = content_stripped.startswith(("[LTM]", "[STM]", "[WM]", "[ELIM]"))
-            has_pointer = "→ h:" in content_stripped
-            has_auto_pointer = "→ h:auto" in content_stripped
-            if not (has_tier and has_pointer) or has_auto_pointer:
-                # Auto-store to hindsight, convert content to pointer format
-                hindsight_key = "auto_" + hashlib.md5(content.encode()).hexdigest()[:12]
-                brief = _extract_brief(content_stripped)
-                # Strip existing tier tag if present (auto-convert normalizes to [STM])
-                if has_tier:
-                    for tag in ("[LTM]", "[STM]", "[WM]", "[ELIM]"):
-                        if brief.startswith(tag):
-                            brief = brief[len(tag):].lstrip()
-                            break
-                # Preserve original tier, default to STM for new entries
-                original_tier = None
-                if has_tier:
-                    for tag in ("[LTM]", "[STM]", "[WM]", "[ELIM]"):
-                        if content_stripped.startswith(tag):
-                            original_tier = tag
-                            break
-                        if content_stripped.startswith("[" + tag):  # [[LTM]]
-                            original_tier = tag
-                            break
-                auto_tier = original_tier if original_tier else "STM"
-                pointer_entry = f"[{auto_tier}] {brief} | → h:{hindsight_key}"
-                logger.info("Auto-convert memory → pointer: %s (hindsight_key=%s)", brief, hindsight_key)
+            # Fire-and-forget hindsight retain
+            try:
+                # Build tags: base + auto-inferred scene/entity + pass-through
+                extra_tags = ["auto-memory", f"key:{hindsight_key}"]
 
-                # 🛡️ 安全兜底: 短内容+指针格式 = 用户传了已格式化的指针而非全文
-                #   此时 obsidian/hindsight 只能存到短关键词，失去上下文。
-                #   正确用法: memory(action='add', content='完整描述性文本')
-                if len(content_stripped) < 100 and has_pointer:
-                    logger.warning(
-                        "三层写入可能不完整: content=%d chars, 含→ h:指针格式. "
-                        "obsidian/hindsight 将只存到关键词而非全文. "
-                        "请用完整描述文本(>100字符)调用 memory(), key=%s",
-                        len(content_stripped), hindsight_key
-                    )
+                # P1: 自动推断场景标签（stock/dev/life/project/trading）
+                scene_tag = _infer_scene_tag(content_stripped)
+                if scene_tag and scene_tag not in extra_tags:
+                    extra_tags.append(scene_tag)
 
-                # Fire-and-forget hindsight retain
-                try:
-                    # Build tags: base + auto-inferred scene/entity + pass-through
-                    extra_tags = ["auto-memory", f"key:{hindsight_key}"]
+                # P2: 自动推断 AMAP entity 标签（基于内容关键词匹配）
+                for entity_tag in _infer_entity_tags(content_stripped):
+                    if entity_tag not in extra_tags:
+                        extra_tags.append(entity_tag)
 
-                    # P1: 自动推断场景标签（stock/dev/life/project/trading）
-                    scene_tag = _infer_scene_tag(content_stripped)
-                    if scene_tag and scene_tag not in extra_tags:
-                        extra_tags.append(scene_tag)
+                # P3: 内容含显式 [AMAP] 路由标记 → 透传实体标签
+                if "[AMAP]" in content_stripped:
+                    for tag in ("entity|concept:amap_routing",):
+                        if tag not in extra_tags:
+                            extra_tags.append(tag)
+                    for line in content_stripped.split("\n"):
+                        m = re.search(r'→\s*(entity\|\w+:\w+)', line)
+                        if m and m.group(1) not in extra_tags:
+                            extra_tags.append(m.group(1))
 
-                    # P2: 自动推断 AMAP entity 标签（基于内容关键词匹配）
-                    for entity_tag in _infer_entity_tags(content_stripped):
-                        if entity_tag not in extra_tags:
-                            extra_tags.append(entity_tag)
-
-                    # P3: 内容含显式 [AMAP] 路由标记 → 透传实体标签
-                    if "[AMAP]" in content_stripped:
-                        for tag in ("entity|concept:amap_routing",):
-                            if tag not in extra_tags:
-                                extra_tags.append(tag)
-                        for line in content_stripped.split("\n"):
-                            m = re.search(r'→\s*(entity\|\w+:\w+)', line)
+                # P4: 内容含显式 entity|/relation| 标记 → 透传
+                if "entity|" in content_stripped or "relation|" in content_stripped:
+                    for line in content_stripped.split("\n"):
+                        line = line.strip()
+                        if line.startswith(("entity|", "relation|")) or "|entity|" in line:
+                            m = re.search(r'(entity\|\w+:\w+|relation\|\w+:\w+)', line)
                             if m and m.group(1) not in extra_tags:
                                 extra_tags.append(m.group(1))
 
-                    # P4: 内容含显式 entity|/relation| 标记 → 透传
-                    if "entity|" in content_stripped or "relation|" in content_stripped:
-                        for line in content_stripped.split("\n"):
-                            line = line.strip()
-                            if line.startswith(("entity|", "relation|")) or "|entity|" in line:
-                                m = re.search(r'(entity\|\w+:\w+|relation\|\w+:\w+)', line)
-                                if m and m.group(1) not in extra_tags:
-                                    extra_tags.append(m.group(1))
+                payload = json.dumps({
+                    "items": [{
+                        "content": content_stripped[:3000],
+                        "tags": extra_tags,
+                        "context": "auto-converted",
+                    }]
+                })
+                subprocess.run(
+                    ["curl", "-s", "-X", "POST",
+                     "http://127.0.0.1:9177/v1/default/banks/hermes/memories",
+                     "-H", "Content-Type: application/json", "-d", payload],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
 
-                    # ── 三层写入：摘要→hindsight，全文→wiki ──
-                    # 第1层：写全文到 Obsidian wiki
-                    obsidian_path = None
-                    try:
-                        obsidian_path = _write_obsidian_raw(
-                            content_stripped,
-                            scene_tag or 'memory',
-                            hindsight_key
-                        )
-                    except Exception as e:
-                        logger.warning("Obsidian raw write failed: %s", e)
-
-                    # 第2层：摘要+指针存到 hindsight
-                    summary = _extract_summary(content_stripped)
-                    if obsidian_path:
-                        hindsight_content = summary  # 原文放tags里，不走content（不会被LLM洗掉）
-                        extra_tags.append(f"ref_obsidian:{obsidian_path}")
-                    else:
-                        hindsight_content = summary
-
-                    payload = json.dumps({
-                        "items": [{
-                            "content": hindsight_content,
-                            "tags": extra_tags,
-                            "context": "auto-converted",
-                            "strategy": "raw",
-                        }]
-                    })
-                    subprocess.run(
-                        ["curl", "-s", "-X", "POST",
-                         "http://127.0.0.1:9177/v1/default/banks/hermes/memories",
-                         "-H", "Content-Type: application/json", "-d", payload],
-                        capture_output=True, timeout=10,
-                    )
-                except Exception:
-                    pass
-
-                # 写指针到 recent_macro.md 详情索引区（替代写入 MEMORY.md）
-                try:
-                    macro_path = os.path.expanduser("~/wiki/docs/agent-memory/recent_macro.md")
-                    date_str = datetime.now().strftime("%m-%d")
-                    pointer_line = f"- {brief} → h:{hindsight_key} [{date_str}]"
-                    os.makedirs(os.path.dirname(macro_path), exist_ok=True)
-                    if os.path.exists(macro_path):
-                        with open(macro_path) as f:
-                            content_lines = f.readlines()
-                        # 找到详情索引区，追加到该区域末尾
-                        in_detail = False
-                        inserted = False
-                        new_lines = []
-                        for line in content_lines:
-                            new_lines.append(line)
-                            if line.strip().startswith("## 近期详情索引"):
-                                in_detail = True
-                                continue
-                            if in_detail:
-                                if line.strip().startswith("## ") or line.strip().startswith("---"):
-                                    # 在当前章节末尾、边界线前插入指针
-                                    new_lines.insert(len(new_lines) - 1, pointer_line + "\n")
-                                    inserted = True
-                                    in_detail = False
-                        if not inserted:
-                            # 没有详情索引区，追加一个
-                            new_lines.append("\n## 近期详情索引\n")
-                            new_lines.append(pointer_line + "\n")
-                        with open(macro_path, "w") as f:
-                            f.writelines(new_lines)
-                    else:
-                        with open(macro_path, "w") as f:
-                            f.write("# 近期宏观记忆（最近14天滚动）\n\n")
-                            f.write("## 宏观结论\n\n")
-                            f.write("## 近期详情索引\n")
-                            f.write(pointer_line + "\n")
-                            f.write("\n---\n")
-                except Exception as macro_e:
-                    logger.warning("Write to recent_macro.md failed: %s", macro_e)
-
-                # 非 [CORE] 内容不写 MEMORY.md，设为空跳过
-                content = ""
+            # Override content with pointer format
+            content = pointer_entry
 
     if action == "add":
-        if not content and target == "memory":
-            # 非 [CORE] 内容已通过 auto-convert 写入 hindsight + recent_macro.md
-            result = {"success": True, "message": "内容已写入 hindsight 和宏观索引"}
-        elif not content:
+        if not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        else:
-            result = store.add(target, content)
+        result = store.add(target, content)
 
     elif action == "replace":
         if not old_text:
@@ -876,38 +713,6 @@ MEMORY_SCHEMA = {
         "required": ["action", "target"],
     },
 }
-
-
-def _infer_scene_tag(content: str) -> Optional[str]:
-    """从文本推断场景标签"""
-    c = content.lower()
-    patterns = [
-        ("scene:stock", ["股票", "股价", "持仓", "买入", "卖出", "止损", "加仓",
-                        "k线", "boll", "adx", "市盈率", "pe", "pb",
-                        "002", "300", "600", "688", "sz.", "sh."]),
-        ("scene:dev", ["代码", "bug", "pr", "merge", "commit", "重构",
-                      "部署", "config", "api", "函数", "模块", "git"]),
-        ("scene:trading", ["回测", "策略", "胜率", "盈亏比", "夏普",
-                          "walk-forward", "参数优化", "信号"]),
-        ("scene:project", ["项目", "进度", "里程碑", "需求", "架构"]),
-        ("scene:research", ["研究", "分析", "推理", "mcts", "深度", "产业链"]),
-    ]
-    for tag, keywords in patterns:
-        if any(kw in c for kw in keywords):
-            return tag
-    return None
-
-
-def _infer_entity_tags(content: str) -> List[str]:
-    """从文本推断实体标签"""
-    tags = []
-    codes = re.findall(r'\b(?:00|30|60|68)\d{3}\b', content)
-    for code in codes:
-        tags.append(f"entity|object:stock_{code}")
-    tools = re.findall(r'tools/[\w_]+|scripts/[\w_]+|src/[\w./]+', content)
-    for t in tools:
-        tags.append(f"entity|resource:{t.replace('/', '_').replace('.py', '')}")
-    return list(set(tags))
 
 
 # --- Registry ---
