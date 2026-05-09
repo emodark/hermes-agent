@@ -592,8 +592,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
-        # AMAP entity keywords (merged with config later)
-        self._amap_entity_keywords: dict[str, list[str]] | None = None
 
         # Bank
         self._bank_mission = ""
@@ -1185,44 +1183,18 @@ class HindsightMemoryProvider(MemoryProvider):
         "entity|concept:meta_knowledge": ["元知识", "六步法", "meta_knowledge", "思维模型", "推理链"],
         "entity|object:balance_sheet": ["负债表", "balance_sheet", "财务数据", "财报"],
         "entity|object:ecc_system": ["ECC", "本能系统", "置信度", "confid", "instinct"],
-        # Memory system components
-        "entity|object:prefetch": ["prefetch", "队列预取", "自动回忆", "auto_recall"],
-        "entity|object:sync_turn": ["sync_turn", "会话存储", "retain", "自动记录"],
-        "entity|object:dedup": ["dedup", "去重", "重复", "去重率"],
-        "entity|object:recall_tag": ["recall_tags", "标签过滤", "召回标签"],
-        "entity|object:amap": ["AMAP", "联想路由", "路由表", "图扩散"],
-        # Stock analysis system
-        "entity|object:backtest": ["回测", "backtest", "参数优化", "回溯验证"],
-        "entity|object:evaluation_framework": ["统一评估", "评分框架", "评估框架", "四维评分", "UnifiedEvaluator"],
-        "entity|object:feature_analysis": ["特征分析", "特征提取", "周线特征", "feature"],
-        "entity|object:scanner": ["扫描器", "scanner", "全市场", "批量扫描", "双通道", "动量追涨", "价值反转"],
-        "entity|object:watchlist": ["watchlist", "自选股", "增选股", "观察池"],
-        "entity|object:calibration": ["校准", "calibration", "反馈分析"],
-        # Report & chart
-        "entity|object:pdf_report": ["PDF", "报告生成", "推送", "报表"],
-        "entity|object:chart": ["图表", "chart", "K线图", "mplfinance", "可视化"],
-        "entity|object:feishu_push": ["飞书", "feishu", "lark", "消息推送", "卡片消息"],
-        # Infrastructure
-        "entity|object:mongodb": ["MongoDB", "mongodb", "数据库存储", "数据层"],
-        "entity|object:futu_opend": ["富途", "OpenD", "futu", "行情API"],
-        "entity|object:wiki": ["wiki", "LLM wiki", "llm-wiki", "知识库", "mkdocs"],
-        # Daily operations
-        "entity|object:cron_job": ["cron", "定时任务", "计划任务", "自动运行"],
-        "entity|object:health_check": ["健康检查", "巡检", "health_check", "audit"],
-        "entity|object:stock_holding": ["持仓股", "持有", "仓位管理", "金字塔加仓", "动态止损"],
-        # Cross-domain data sources
-        "entity|object:hibor_report": ["慧博", "研报", "hibor", "研报摘要"],
-        "entity|object:jin10_flash": ["快讯", "flash_news", "实时资讯"],
     }
 
-    def _infer_entity_tags_from_content(self, content: str) -> list[str]:
+    @staticmethod
+    def _infer_entity_tags_from_content(content: str) -> list[str]:
         """Auto-infer AMAP entity tags from content keywords."""
         if not content:
             return []
-        keywords_dict = self._amap_entity_keywords or HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS
         content_lower = content.lower()
         tags = []
-        for entity_tag, keywords in keywords_dict.items():
+        for entity_tag, keywords in type.__dict__.get(
+                "_AMAP_ENTITY_KEYWORDS",
+                HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS).items():
             for kw in keywords:
                 if kw.lower() in content_lower:
                     tags.append(entity_tag)
@@ -1645,28 +1617,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
 
-        # AMAP entity keywords: merge config overrides on top of defaults
-        config_keywords = self._config.get("amap_entity_keywords", {})
-        if config_keywords and isinstance(config_keywords, dict):
-            base = dict(HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS)
-            base.update(config_keywords)
-            self._amap_entity_keywords = base
-        else:
-            self._amap_entity_keywords = dict(HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS)
-
-        # Also merge from config.yaml hindsight.amap_entity_keywords
-        try:
-            import yaml
-            yaml_path = get_hermes_home() / "config.yaml"
-            if yaml_path.exists():
-                yaml_cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-                yaml_kw = (yaml_cfg or {}).get("hindsight", {}).get("amap_entity_keywords")
-                if yaml_kw and isinstance(yaml_kw, dict):
-                    self._amap_entity_keywords.update(yaml_kw)
-                    logger.debug("AMAP: merged %d entity keywords from config.yaml", len(yaml_kw))
-        except Exception as exc:
-            logger.debug("AMAP: config.yaml merge skipped (%s)", exc)
-
         _client_version = "unknown"
         try:
             from importlib.metadata import version as pkg_version
@@ -1811,106 +1761,6 @@ class HindsightMemoryProvider(MemoryProvider):
         scored.sort(key=lambda x: -x[0])
         return scored
 
-    @staticmethod
-    def _dedup_normalize(text: str) -> str:
-        """归一化去重用文本：去后缀、去冠词、归一化日期、去标点空格。
-
-        返回纯小写归一化字符串，用于编辑距离比较。
-        """
-        s = text.strip()
-        # 1. 剥离 "| When:", "| Involving:", " | 时间:" 等附属后缀
-        s = re.split(
-            r"\s*\|\s*(?:When|Involving|时间)\s*[:：]\s*",
-            s, maxsplit=1
-        )[0].strip()
-        # 2. 剥离 " | 2026年X月X日" 尾巴
-        s = re.sub(r"\s*\|\s*\d{4}年\d{1,2}月\d{1,2}日.*", "", s).strip()
-        # 2.5 去除反引号（`code` → code）
-        s = s.replace("`", "")
-        # 3. 统一日期格式: "May 09" → "may 9", "May 9" → "may 9"
-        s = re.sub(r"(\d{4}[-/])(\d{1,2})([-/]\d{1,2})",
-                   lambda m: m.group(1) + str(int(m.group(2))) + m.group(3), s)
-        s = re.sub(r"(may|jun|jul|aug|sep|oct|nov|dec)\s+0+(\d)",
-                   lambda m: m.group(1) + " " + m.group(2), s, flags=re.I)
-        s = re.sub(r"(may|jun|jul|aug|sep|oct|nov|dec)\s+(\d+)",
-                   lambda m: m.group(1).lower() + " " + str(int(m.group(2))), s, flags=re.I)
-        # 4. 去掉句首冠词
-        s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I)
-        # 5. 折叠空白、转小写
-        s = re.sub(r"\s+", " ", s).lower().strip()
-        return s
-
-    def _dedup_results(self, scored: list) -> list:
-        """去除内容重复的记忆（精确+模糊），保留时间衰减加权后分数最高的版本。
-
-        两层去重：
-        1. 精确去重（归一化后字符串完全一致）
-        2. 模糊去重（编辑距离 >0.80，内容实质相同但措辞稍异）
-
-        重复来源：daily-summary 自动留存会存同一事件多种措辞的版本，
-        以及 hindsight 知识图自动生成的冗余描述。
-
-        Returns:
-            去重后的 list，格式不变，按原顺序排列。
-        """
-        from difflib import SequenceMatcher
-
-        deduped: list = []
-        seen_exact: set = set()      # 精确去重 key
-        kept_norms: list[tuple[str, tuple]] = []  # (norm_text, item) 用于模糊比较
-
-        _FUZZY_THRESHOLD = 0.80
-
-        for item in scored:
-            text = item[3]
-            norm = self._dedup_normalize(text)
-
-            # ── 第一层：精确去重（归一化后全等）──
-            if norm not in seen_exact:
-                seen_exact.add(norm)
-
-                # ── 第二层：模糊去重 ──
-                # 先做快速预检，再算编辑距离
-                is_fuzzy_dup = False
-                for kept_norm, kept_item in kept_norms:
-                    # 策略1: 子串包含（短⊂长）——一个被另一个完全包含，铁定重复
-                    shorter, longer = (norm, kept_norm) if len(norm) < len(kept_norm) else (kept_norm, norm)
-                    if shorter in longer:
-                        is_fuzzy_dup = True
-                    else:
-                        # 策略2: 编辑距离——用长度比归一化后的相似度
-                        # 快速预检：长度差 >50% 直接跳过（不是重复）
-                        max_len = max(len(norm), len(kept_norm))
-                        if max_len > 0 and abs(len(norm) - len(kept_norm)) / max_len > 0.50:
-                            continue
-                        ratio = SequenceMatcher(None, norm, kept_norm).ratio()
-                        if ratio > _FUZZY_THRESHOLD:
-                            is_fuzzy_dup = True
-
-                    if is_fuzzy_dup:
-                        # 模糊重复：保留分数更高的那个
-                        if item[0] > kept_item[0]:
-                            # 当前项分数更高 → 替换
-                            for k, (kn, ki) in enumerate(kept_norms):
-                                if ki is kept_item:
-                                    kept_norms[k] = (kn, item)
-                                    break
-                            for k, existing in enumerate(deduped):
-                                if existing is kept_item:
-                                    deduped[k] = item
-                                    break
-                        break
-
-                if not is_fuzzy_dup:
-                    kept_norms.append((norm, item))
-                    deduped.append(item)
-
-        removed = len(scored) - len(deduped)
-        if removed > 0:
-            logger.debug("Dedup: removed %d duplicates (exact+fuzzy), %d → %d items",
-                         removed, len(scored), len(deduped))
-        return deduped
-
     def _scene_filter_results(self, scored: list, query: str) -> list:
         """场景隔离重排序：检测查询场景，同场景结果优先。
 
@@ -2009,66 +1859,8 @@ class HindsightMemoryProvider(MemoryProvider):
                     logger.debug("Prefetch: recall returned %d results", num_results)
                     # 艾宾浩斯时间衰减重排序
                     scored = self._rerank_with_time_decay(resp.results or [])
-                    # 去重：daily-summary 重复记忆，保留分数最高版本
-                    scored = self._dedup_results(scored)
                     # 场景隔离重排序：检测查询场景，同场景结果优先
                     scored = self._scene_filter_results(scored, query)
-                    # ── P0/P1/P2/P3 分级过滤 ──
-                    # P0: entity|object 标签 → 全量保留（高价值，通常带 AMAP 实体映射）
-                    # P1: 纯 auto_retain（无 entity|object）→ 最多 3 条（备查即可）
-                    # P2: 其它（非 skill 非 auto）→ 正常保留
-                    # P3: skill 日常更新类 → 压缩为摘要，保留实体+动作+时间
-                    try:
-                        import re
-                        p0, p1_auto, p2_other, p3 = [], [], [], []
-                        for s in scored:
-                            content = s[3] if len(s) > 3 else ""
-                            tags = s[4] if len(s) > 4 else []
-                            has_entity_obj = any(str(t).startswith("entity|object:") for t in tags)
-                            has_auto_retain = any("entity|concept:auto_retain" in str(t) for t in tags)
-                            is_skill = any(kw in content.lower() for kw in
-                                           ["skill update", "skill library", "skills 更新"])
-                            if has_entity_obj:
-                                p0.append(s)      # P0: 高价值
-                            elif has_auto_retain and not has_entity_obj:
-                                p1_auto.append(s)  # P1: 纯 auto_retain，限流
-                            elif is_skill:
-                                p3.append(s)       # P3: skill 更新
-                            else:
-                                p2_other.append(s) # P2: 其他有价值内容
-                        # P1: auto_retain 最多保留 5 条
-                        auto_cap = min(len(p1_auto), 5)
-                        if len(p1_auto) > 5:
-                            logger.debug("Prefetch P1(auto_retain): capped %d→5", len(p1_auto))
-                        p1_capped = p1_auto[:5]
-                        # 压缩 P3：提取核心事实，不丢 who/when
-                        if p3:
-                            old_count = len(p3)
-                            seen_fingerprint = set()
-                            p3_compressed = []
-                            for s in p3:
-                                content = s[3]
-                                # 提取核心事实：取 "| When:" 之前的部分作为key
-                                # 格式: "<实体> <动作> <详情> | When: <日期> | Involving: <谁>"
-                                core_part = content.split("| When:")[0].split("| 时间:")[0].strip()
-                                # 规范化fingerprint用于去重
-                                fp = re.sub(r'\s+', ' ', core_part.lower())[:50]
-                                if fp not in seen_fingerprint:
-                                    seen_fingerprint.add(fp)
-                                    # 核心事实完整保留，不需要截断
-                                    p3_compressed.append(
-                                        (s[0], s[1] * 0.6, s[2], core_part,
-                                         s[4] if len(s) > 4 else [])
-                                    )
-                            logger.debug("Prefetch P0/P1/P2/P3: P0=%d P1=%d→%d P2=%d P3=%d→%d",
-                                         len(p0), len(p1_auto), len(p1_capped),
-                                         len(p2_other), old_count, len(p3_compressed))
-                            scored = p0 + p1_capped + p2_other + p3_compressed
-                        else:
-                            logger.debug("Prefetch P0/P1/P2/P3: P0=%d P1=%d→%d P2=%d P3=0",
-                                         len(p0), len(p1_auto), len(p1_capped), len(p2_other))
-                    except Exception as e:
-                        logger.debug("Prefetch P0/P1/P2/P3 grading failed, using raw results: %s", e)
                     text = "\n".join(f"- {s[3]}" for s in scored) if scored else ""
 
                 # ── PPR 图扩散扩展 ──
@@ -2124,99 +1916,6 @@ class HindsightMemoryProvider(MemoryProvider):
                         logger.debug("Prefetch PPR expand failed: %s", ppr_e, exc_info=True)
 
                 if text:
-                    # ── 文本去重（精确+模糊近义） ──
-                    lines = text.split("\n")
-                    seen_exact = set()
-                    seen_norm = set()  # 归一化指纹→原内容映射
-                    deduped = []
-                    dedup_exact = 0
-                    dedup_fuzzy = 0
-
-                    def _normalize(s: str) -> str:
-                        """归一化：去前缀、降维、去停用词、取前40字符指纹"""
-                        s = s.strip()
-                        # 去掉常见前缀行标记
-                        for p in ("- ", "# 联想记忆扩展", "[去重:", "# "):
-                            if s.startswith(p):
-                                s = s[len(p):].lstrip()
-                        # 去掉行首 [关联:0.85] / [截断:...] 等标记
-                        import re
-                        s = re.sub(r'^\[.*?\]\s*', '', s)
-                        s = s.lower().strip()
-                        # 去掉句首冠词
-                        for art in ("the ", "a ", "an ", "this ", "that "):
-                            if s.startswith(art):
-                                s = s[len(art):]
-                        # 去掉标点
-                        s = re.sub(r'[^\w\s]', '', s)
-                        # 压缩空格
-                        s = ' '.join(s.split())
-                        # 取前40字符作为指纹
-                        return s[:40]
-
-                    for line in lines:
-                        content = line.lstrip("- ").lstrip()
-                        # 保留空行和标题行
-                        if not content.strip() or content.startswith("#"):
-                            deduped.append(line)
-                            continue
-                        # 第1层：精确去重
-                        if content in seen_exact:
-                            dedup_exact += 1
-                            continue
-                        seen_exact.add(content)
-                        # 第2层：归一化近义去重
-                        norm = _normalize(content)
-                        if norm and norm in seen_norm:
-                            dedup_fuzzy += 1
-                            continue
-                        seen_norm.add(norm)
-                        deduped.append(line)
-
-                    total_dedup = dedup_exact + dedup_fuzzy
-                    if total_dedup > 0:
-                        logger.debug("Prefetch dedup: exact=%d fuzzy=%d total=%d → %d lines left",
-                                     dedup_exact, dedup_fuzzy, total_dedup, len(deduped))
-                        if deduped:
-                            deduped.append(f"[去重: 移除 {total_dedup} 条(精确{dedup_exact}+模糊{dedup_fuzzy})]")
-                        text = "\n".join(deduped)
-
-                    # ── token 预算截断 ──
-                    # 防止 prefetch 结果超长注入 context
-                    max_chars = self._recall_max_tokens * 4  # 中文约 1 token/2 chars, 保守估 1/4
-                    if len(text) > max_chars:
-                        lines = text.split("\n")
-                        # 先尝试截断 PPR 扩展部分（优先保留核心 recall 结果）
-                        ppr_idx = None
-                        for i, line in enumerate(lines):
-                            if line.strip().startswith("# 联想记忆扩展"):
-                                ppr_idx = i
-                                break
-                        if ppr_idx is not None and len(text) > max_chars:
-                            # 截断 PPR 部分
-                            core = lines[:ppr_idx]
-                            ext = lines[ppr_idx:]
-                            # 从后往前删 PPR 行
-                            while len("\n".join(core + [""] + ext)) > max_chars and len(ext) > 1:
-                                ext.pop()
-                            if len("\n".join(core + [""] + ext)) > max_chars:
-                                # 如果还超，截断核心结果
-                                while len("\n".join(core)) > max_chars * 0.7 and len(core) > 3:
-                                    core.pop()
-                                lines = core
-                                if ext:
-                                    lines.extend(ext)
-                            else:
-                                lines = core + ext
-                        else:
-                            # 没有 PPR，直接截断核心结果行
-                            while len("\n".join(lines)) > max_chars and len(lines) > 3:
-                                lines.pop()
-                        if len(lines) < len(text.split("\n")):
-                            truncated = len(text.split("\n")) - len(lines)
-                            lines.append(f"[截断: 省略 {truncated} 行]\n")
-                        text = "\n".join(lines)
-
                     with self._prefetch_lock:
                         self._prefetch_result = text
             except Exception as e:
@@ -2250,8 +1949,8 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 entity_kwargs: dict = {
                     "bank_id": self._bank_id, "query": "",
-                    "budget": "low", "max_tokens": 1000,
-                    "tags": ["entity|object", "entity|concept"],
+                    "budget": "low", "max_tokens": 1500,
+                    "tags": ["auto-memory"],
                     "tags_match": "any",
                 }
                 e_resp = self._run_hindsight_operation(
@@ -2351,72 +2050,6 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["tags"] = merged_tags
         return kwargs
 
-    # ── 质量门禁：避免低价值对话轮次存入长期记忆 ──
-    # 当前 auto_retain 的主要噪声来源是纯确认语、单字符回复、无信息量的问候
-    # 此处用轻量启发式规则过滤，不做 LLM 调用
-    _RETAIN_QUALITY_MIN_LENGTH = 60
-    _RETAIN_QUALITY_INFO_MARKERS = [
-        # 用户决策/行为
-        "决定", "采用", "选择", "改成", "改为", "换用", "替代", "替换",
-        # 分析/评估
-        "分析", "评估", "报告", "对比", "回测", "验证", "检查", "检测",
-        # 代码/配置/部署
-        "代码", "修改", "修复", "配置", "部署", "commit", "merge", "patch",
-        "git", "ssh", "config", "docker", "npm", "pip", "uv",
-        "max_tokens", "recall", "auto_retain", "recall_tags",
-        # 股票
-        "持仓", "买入", "卖出", "止损", "加仓", "涨停", "跌停",
-        "ADX", "BOLL", "金叉", "死叉", "支撑", "压力", "突破",
-        # 工具调用结果
-        "报错", "错误", "失败", "成功", "完成", "结果",
-        "Traceback", "Error", "Exception",
-    ]
-    _RETAIN_QUALITY_LOW_VALUE_USER = {
-        "", ".", "?", "？", "。", "！", "~", "好", "嗯", "ok",
-        "在吗", "在？", "继续",
-    }
-
-    def _check_retain_quality(self, user_content: str, assistant_content: str) -> bool:
-        """判断本轮对话内容是否值得持久化到 Hindsight 记忆库。
-
-        启发式规则（无 LLM 调用）：
-        1. 用户消息是单字符/问候/确认语 → 跳过
-        2. 总长度 < 60 字符且无信息标记 → 跳过
-        3. 包含信息标记（分析/修复/代码/报错/持仓等）→ 保留
-        4. 总长度 > 150 字符 → 保留（可能有隐含信息）
-        5. 默认：保守保留（宁可多存不漏存）
-        """
-        clean_user = user_content.strip().rstrip(".!！。？?~")
-        clean_asst = assistant_content.strip().rstrip(".!！。？?~")
-
-        # 规则1：空内容
-        if not clean_user and not clean_asst:
-            return False
-
-        # 规则2：用户消息是低价值内容
-        if clean_user.lower() in self._RETAIN_QUALITY_LOW_VALUE_USER:
-            return False
-
-        total_len = len(clean_user) + len(clean_asst)
-
-        # 规则3：包含信息标记 → 保留
-        user_lower = clean_user.lower()
-        asst_lower = clean_asst.lower()
-        has_info = any(m in user_lower or m in asst_lower
-                       for m in self._RETAIN_QUALITY_INFO_MARKERS)
-        if has_info:
-            return True
-
-        # 规则4：总长度小于阈值且无信息 → 跳过
-        if total_len < self._RETAIN_QUALITY_MIN_LENGTH:
-            return False
-
-        # 规则5：足够长 → 保留
-        if total_len > 150:
-            return True
-
-        return True  # 默认保守
-
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue a retain for the current turn. Non-blocking.
 
@@ -2479,13 +2112,6 @@ class HindsightMemoryProvider(MemoryProvider):
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
 
-        # ── 质量门禁：跳过低价值轮次 ──
-        if not self._check_retain_quality(user_content, assistant_content):
-            logger.debug("sync_turn: quality gate rejected, clearing %d buffered turns",
-                         len(self._session_turns))
-            self._session_turns.clear()
-            return
-
         def _do_retain() -> None:
             item = self._build_retain_kwargs(
                 content,
@@ -2546,52 +2172,6 @@ class HindsightMemoryProvider(MemoryProvider):
                     [r["target"] for r in parsed["relations"]],
                 )
 
-            # ── 语义去重：retain 前检查是否已有近重复内容 ──
-            dedup_enabled = self._config.get("dedup", True)
-            if dedup_enabled and content.strip():
-                try:
-                    import subprocess
-                    dedup_script = os.path.join(get_hermes_home(), "hindsight", "memory_dedup.py")
-                    r = subprocess.run(
-                        ["python3", dedup_script, "filter"],
-                        input=content.encode("utf-8"),
-                        capture_output=True, timeout=10,
-                    )
-                    stdout = r.stdout.decode("utf-8", errors="replace").strip()
-                    # returncode: 0=唯一  1=严格重复(≥0.85)  2=近似(≥0.70)
-                    if r.returncode in (1, 2):
-                        label = "duplicate" if r.returncode == 1 else "approximate"
-                        score_str = stdout.split("|")[1] if "|" in stdout else "?"
-                        logger.debug("hindsight_retain: skipped (%s, score=%s)", label, score_str)
-                        return json.dumps({"result": f"Memory already exists ({label}, deduplicated)."})
-                except Exception as e:
-                    logger.debug("hindsight_retain: dedup check failed, proceeding: %s", e)
-
-            # ── Entity-based dedup: if same entity tags exist within 24h, skip ──
-            try:
-                from datetime import datetime, timezone, timedelta
-                entity_dedup_hours = int(self._config.get("entity_dedup_window_hours", 24))
-                if auto_entity_tags and entity_dedup_hours > 0:
-                    for entity_tag in auto_entity_tags:
-                        recent_entity = self._tag_recall(entity_tag, limit=3, query="")
-                        now_utc = datetime.now(timezone.utc)
-                        has_recent = False
-                        for r in recent_entity:
-                            created_str = getattr(r, "mentioned_at", None) or getattr(r, "created_at", None) or ""
-                            if created_str:
-                                try:
-                                    created = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                                    if (now_utc - created) < timedelta(hours=entity_dedup_hours):
-                                        has_recent = True
-                                        break
-                                except (ValueError, TypeError):
-                                    continue
-                        if has_recent:
-                            logger.debug("hindsight_retain: entity dedup hit for %s, skipping", entity_tag)
-                            return json.dumps({"result": f"Memory already exists (entity dedup: {entity_tag})."})
-            except Exception as e:
-                logger.debug("hindsight_retain: entity dedup failed, proceeding: %s", e)
-
             try:
                 retain_kwargs = self._build_retain_kwargs(
                     content,
@@ -2625,7 +2205,6 @@ class HindsightMemoryProvider(MemoryProvider):
 
                 # 艾宾浩斯时间衰减重排序
                 scored = self._rerank_with_time_decay(results)
-                scored = self._dedup_results(scored)
                 lines = [f"{i}. {s[3]}" for i, s in enumerate(scored, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
@@ -2641,7 +2220,6 @@ class HindsightMemoryProvider(MemoryProvider):
                     if not resp.results:
                         return json.dumps({"result": "No relevant memories found."})
                     scored = self._rerank_with_time_decay(resp.results)
-                    scored = self._dedup_results(scored)
                     lines = [f"{i}. {s[3]}" for i, s in enumerate(scored, 1)]
                     return json.dumps({"result": "\n".join(lines)})
                 except Exception as e2:
@@ -2797,102 +2375,34 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # ── TiMEM P2: Session summary + chain consolidation ─────────────────
 
-    # ── 提取会话关键事实的关键词模式 ──
-    _SUMMARY_ACTION_KEYWORDS = [
-        "修改", "新增", "删除", "配置", "设置", "改成了", "改为",
-        "修复", "解决", "实现了", "添加", "升级", "迁移", "部署",
-        "决定", "选择了", "方案", "放弃了", "同意",
-        "发现", "根因", "原因", "问题", "障碍",
-    ]
-    _SUMMARY_SKIP_PREFIXES = [
-        "User:", "Assistant:", "用户:", "助手:",
-    ]
-
-    def _extract_key_facts(self, text: str) -> list[str]:
-        """从助手回答中提取含关键动作的事实句。"""
-        text = text.strip()
-        # 跳过角色前缀
-        for p in self._SUMMARY_SKIP_PREFIXES:
-            if text.startswith(p):
-                text = text[len(p):].strip()
-
-        facts = []
-        # 按句号/换行分割
-        for line in text.replace("\\n", "\n").split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            # 检查是否含动作关键词
-            if any(kw in line for kw in self._SUMMARY_ACTION_KEYWORDS):
-                # 截取到160字符，保持完整句
-                if len(line) > 160:
-                    line = line[:157] + "..."
-                facts.append(line)
-        return facts
-
     def _build_session_summary(self) -> str:
-        """提取会话中的关键事实、决策和变更，输出结构化摘要。
-
-        区别于旧版（拼接原文），新版只保留含动作关键词的句子，
-        压缩成 3-8 行关键事实，更适合 hindsight 召回。
-        """
+        """Build a compact summary of this session's turns."""
         if not self._session_turns:
             return ""
-
-        all_facts: list[str] = []
+        # Extract unique topic lines
         seen: set[str] = set()
-        total_user = 0
-        total_assistant = 0
-
+        items: list[str] = []
         for t in self._session_turns:
             try:
                 parsed = json.loads(t)
-                msgs = parsed if isinstance(parsed, list) else [parsed]
-                for msg in msgs:
-                    raw = msg.get("content") or ""
-                    role = msg.get("role", "")
-                    if role == "user":
-                        total_user += 1
-                    elif role == "assistant":
-                        total_assistant += 1
-                        facts = self._extract_key_facts(raw)
-                        for f in facts:
-                            norm = re.sub(r"\s+", " ", f).strip().lower()[:60]
-                            if norm not in seen:
-                                seen.add(norm)
-                                all_facts.append(f)
+                for msg in parsed if isinstance(parsed, list) else [parsed]:
+                    text = (msg.get("content") or "")[:200]
+                    if text and text not in seen:
+                        seen.add(text)
+                        items.append(f"- {text}")
             except (json.JSONDecodeError, TypeError):
-                pass
+                text = str(t)[:200]
+                if text and text not in seen:
+                    seen.add(text)
+                    items.append(f"- {text}")
 
-        if not all_facts and not total_user:
+        if not items:
             return ""
-
-        # 标题
-        sid = self._session_id[:12] if self._session_id else "unknown"
-        lines: list[str] = [
-            f"【会话摘要·{sid}】",
-            f"共 {total_user} 轮用户对话，{total_assistant} 轮助手回复",
-        ]
-
-        # 场景标签推断（用来生成场景前缀）
-        all_text = json.dumps(self._session_turns) if self._session_turns else ""
-        scene = self._infer_scene(all_text)
-        if scene:
-            lines[0] = f"【{scene}·{sid}】"
-
-        # 关键事实（不超过8条）
-        for f in all_facts[:8]:
-            lines.append(f"- {f}")
-
-        n_more = len(all_facts) - 8
-        if n_more > 0:
-            lines.append(f"  ... 还有 {n_more} 条变更")
-
-        # 无关键事实时的兜底
-        if not all_facts:
-            lines.append("- 本会话主要讨论和调试，无明显关键变更")
-
-        return "\n".join(lines)
+        prefix = f"【会话摘要·{self._session_id[:12] if self._session_id else 'unknown'}】"
+        summary = f"{prefix}本会话共{len(self._session_turns)}轮\n" + "\n".join(items[:20])
+        if len(items) > 20:
+            summary += f"\n  ... 还有 {len(items) - 20} 条"
+        return summary
 
     def on_session_end(self, messages: list[dict]) -> None:
         """Generate session summary and trigger chain consolidation (P2).
