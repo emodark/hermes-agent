@@ -39,63 +39,15 @@ import re
 import threading
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
+from .memory_graph import MemoryGraph
 
 logger = logging.getLogger(__name__)
-
-# ── BM25 索引模块加载器 ─────────────────────────────────
-# 不能用 from tools.bm25_index import ... 因为 Hermes Agent 自带的 tools/
-# 包名冲突，Python 启动时已加载 tools/ 作为系统包。
-# 改用 importlib 直接从文件路径加载。
-import importlib.util as _importlib_util
-_BM25_MODULE: object = None
-_BM25_FILE = os.path.expanduser("~/stockWeeklyAnalyzer/tools/bm25_index.py")
-
-
-def _load_bm25():
-    """加载 BM25 模块（按需，带缓存）。"""
-    global _BM25_MODULE
-    if _BM25_MODULE is not None:
-        return _BM25_MODULE
-    if not os.path.isfile(_BM25_FILE):
-        logger.debug("BM25 module not found at %s", _BM25_FILE)
-        return None
-    try:
-        spec = _importlib_util.spec_from_file_location("bm25_index_local", _BM25_FILE)
-        if spec and spec.loader:
-            mod = _importlib_util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            _BM25_MODULE = mod
-            logger.debug("BM25 module loaded from %s", _BM25_FILE)
-            return mod
-    except Exception as e:
-        logger.debug("BM25 module load failed: %s", e)
-    return None
-
-
-# ── 初始化 BM25 索引持久化路径 ─────────────────────────
-_BM25_MODULE = _load_bm25()
-if _BM25_MODULE is not None:
-    try:
-        _BM25_INDEX_DIR = os.path.join(
-            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "hindsight"
-        )
-        os.makedirs(_BM25_INDEX_DIR, exist_ok=True)
-        _BM25_INDEX_FILE = os.path.join(_BM25_INDEX_DIR, "bm25_index.json.gz")
-        _BM25_MODULE.set_index_path(_BM25_INDEX_FILE)
-        _BM25_MODULE.load_or_create_index(_BM25_INDEX_FILE)
-        logger.debug(
-            "BM25 index loaded: %d docs from %s",
-            _BM25_MODULE.get_index().doc_count(),
-            _BM25_INDEX_FILE,
-        )
-    except Exception as e:
-        logger.debug("BM25 index init: %s", e)
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
@@ -271,11 +223,8 @@ def _get_loop() -> asyncio.AbstractEventLoop:
 
 def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
     """Schedule *coro* on the shared loop and block until done."""
-    from agent.async_utils import safe_schedule_threadsafe
     loop = _get_loop()
-    future = safe_schedule_threadsafe(coro, loop)
-    if future is None:
-        raise RuntimeError("Hindsight loop unavailable")
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=timeout)
 
 
@@ -304,10 +253,6 @@ RETAIN_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Optional per-call tags to merge with configured default retain tags.",
             },
-            "raw": {
-                "type": "boolean",
-                "description": "If true, also write full text to Obsidian vault and store summary+pointer in hindsight.",
-            },
         },
         "required": ["content"],
     },
@@ -316,16 +261,22 @@ RETAIN_SCHEMA = {
 RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
-        "Search long-term memory. Returns memories ranked by relevance using "
-        "semantic search, keyword matching, entity graph traversal, and reranking."
+        "Search long-term memory with multi-hop association expansion. "
+        "Returns memories ranked by relevance using semantic search, "
+        "keyword matching, entity graph traversal, and reranking."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
-            "tags": {
-                "type": "array", "items": {"type": "string"},
-                "description": "Filter results to memories matching these tags (e.g. [\"scene:stock\"]). Uses recall_tags_match mode from config.",
+            "mode": {
+                "type": "string",
+                "enum": ["task", "innovation"],
+                "description": "'task' (default, strong relations only) or 'innovation' (include weak/novel associations)",
+            },
+            "hops": {
+                "type": "integer",
+                "description": "Number of expansion hops. 2 for task mode, 3 for innovation.",
             },
         },
         "required": ["query"],
@@ -474,7 +425,7 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     current_base_url = config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
 
     # The embedded daemon expects OpenAI wire format for these providers.
-    daemon_provider = "openai" if current_provider in {"openai_compatible", "openrouter"} else current_provider
+    daemon_provider = "openai" if current_provider in ("openai_compatible", "openrouter") else current_provider
 
     env_values = {
         "HINDSIGHT_API_LLM_PROVIDER": str(daemon_provider),
@@ -604,7 +555,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
-        self._prefetch_raw = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
@@ -637,15 +587,52 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = True
+        self._memory_graph = MemoryGraph()
         self._recall_max_tokens = 4096
         self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+        # AMAP entity keywords (merged with config later)
+        self._amap_entity_keywords: dict[str, list[str]] | None = None
 
         # Bank
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
+
+    # ── TiMEM Scene auto-classification keywords ──────────────────────────
+    _SCENE_KEYWORDS = {
+        "stock":   ["股票", "K线", "涨停", "跌停", "ADX", "BOLL", "持仓", "买入", "卖出",
+                     "行情", "大盘", "板块", "仓位", "止损", "止盈", "均线", "成交量",
+                     "换手率", "趋势", "突破", "回调", "反弹", "支撑", "压力"],
+        "dev":     ["bug", "修复", "部署", "配置", "API", "skill", "MongoDB", "git",
+                     "错误", "报错", "调试", "代码", "函数", "类", "模块", "重构",
+                     "升级", "迁移", "版本", "commit", "push", "PR"],
+        "life":    ["猫", "福宝", "吃饭", "天气", "旅行", "日记", "生活", "个人",
+                     "德文", "宠物", "健康", "运动", "电影", "音乐"],
+        "project": ["方案", "计划", "设计", "架构", "路线图", "需求", "规划",
+                     "文档", "设计稿", "顶层设计", "流程图", "分析", "对比",
+                     "调研", "评审", "里程碑", "deadline"],
+        "trading": ["交易", "止损", "仓位", "预期", "目标价", "风报比",
+                     "加仓", "减仓", "清仓", "底仓", "做T", "回撤", "胜率",
+                     "盈亏比", "信号", "入场", "出场"],
+    }
+
+    def _infer_scene(self, content: str) -> str:
+        """Auto-infer scene tag from content keywords."""
+        if not content:
+            return ""
+        content_lower = content.lower()
+        scores = {}
+        for scene_name, keywords in self._SCENE_KEYWORDS.items():
+            score = sum(1 for kw in keywords if kw.lower() in content_lower)
+            if score > 0:
+                scores[scene_name] = score
+        if not scores:
+            return ""
+        return max(scores, key=scores.get)
+
+    # ── Session message helpers ───────────────────────────────────────────
 
     @property
     def name(self) -> str:
@@ -655,7 +642,7 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
-            if mode in {"local", "local_embedded"}:
+            if mode in ("local", "local_embedded"):
                 available, _ = _check_local_runtime()
                 return available
             if mode == "local_external":
@@ -938,17 +925,10 @@ class HindsightMemoryProvider(MemoryProvider):
                         "Hindsight local runtime is unavailable"
                         + (f": {reason}" if reason else "")
                     )
-                try:
-                    from tools.lazy_deps import ensure as _lazy_ensure
-                    _lazy_ensure("memory.hindsight", prompt=False)
-                except ImportError:
-                    pass
-                except Exception as _e:
-                    raise ImportError(str(_e))
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
-                if llm_provider in {"openai_compatible", "openrouter"}:
+                if llm_provider in ("openai_compatible", "openrouter"):
                     llm_provider = "openai"
                 logger.debug("Creating HindsightEmbedded client (profile=%s, provider=%s)",
                              self._config.get("profile", "hermes"), llm_provider)
@@ -1117,6 +1097,419 @@ class HindsightMemoryProvider(MemoryProvider):
             return self._session_id, "append"
         return fallback_document_id, None
 
+    # ── Entity/Relation tag parsing for associative memory ─────────────────
+    _ENTITY_RE = re.compile(r'^entity\|(\w+):(.+)$')
+    _RELATION_RE = re.compile(r'^relation\|(\w+):(.+)$')
+    _ATTR_RE = re.compile(r'^(\w[\w.]*):(.+)$')
+
+    def _parse_entity_tags(self, tags: list[str]) -> dict:
+        """Parse entity|type:name and relation|prefix:target format tags.
+
+        Args:
+            tags: Raw tag strings like ["entity|object:weekly_recommend",
+                  "obj.state:current", "relation|depend:market_scan"]
+
+        Returns:
+            {"entities": [{"type": str, "name": str, "raw": str}, ...],
+             "relations": [{"prefix": str, "target": str, "raw": str}, ...],
+             "attributes": {"key": "value", ...},
+             "descriptive": [str, ...]}  # unparseable tags
+        """
+        result: dict = {
+            "entities": [],
+            "relations": [],
+            "attributes": {},
+            "descriptive": [],
+        }
+        if not tags:
+            return result
+
+        for tag in tags:
+            tag = tag.strip()
+            m = self._ENTITY_RE.match(tag)
+            if m:
+                result["entities"].append({
+                    "type": m.group(1),
+                    "name": m.group(2),
+                    "raw": tag,
+                })
+                continue
+
+            m = self._RELATION_RE.match(tag)
+            if m:
+                result["relations"].append({
+                    "prefix": m.group(1),
+                    "target": m.group(2),
+                    "raw": tag,
+                })
+                continue
+
+            m = self._ATTR_RE.match(tag)
+            if m and not tag.startswith(("[", "→", "entity", "relation")):
+                result["attributes"][m.group(1)] = m.group(2)
+                continue
+
+            result["descriptive"].append(tag)
+
+        if result["entities"] or result["relations"]:
+            logger.debug(
+                "Parsed entity tags: %d entities, %d relations, %d attrs",
+                len(result["entities"]), len(result["relations"]),
+                len(result["attributes"]),
+            )
+        return result
+
+    # ── Multi-hop graph expansion engine ──────────────────────────────────
+    # AMAP route table: keyword → entity mapping for associative routing
+    _AMAP_ROUTES = {
+        "每周推荐": "entity|object:weekly_recommend",
+        "数据": "entity|object:data_pipeline",
+        "一目均衡": "entity|object:ichimoku_fix",
+        "ECC": "entity|object:ecc_system",
+        "持仓": "entity|object:holding_analysis",
+        "金十": "entity|object:jin10_data",
+        "元知识": "entity|concept:meta_knowledge",
+        "负债表": "entity|object:balance_sheet",
+    }
+    # Dynamic routes discovered from memory graph (auto-expanded)
+    _AMAP_DYNAMIC_ROUTES: dict[str, str] = {}
+    _AMAP_DYNAMIC_PREFETCH_COUNT = 0
+
+    # Auto-tag keywords: content keywords → entity tag for retain auto-labeling
+    _AMAP_ENTITY_KEYWORDS = {
+        "entity|object:weekly_recommend": ["每周推荐", "weekly_recommend", "周度分析", "市场扫描"],
+        "entity|object:data_pipeline": ["数据层", "data_pipeline", "K线存储", "指标计算", "kline_storage"],
+        "entity|object:ichimoku_fix": ["一目均衡", "ichimoku", "云图", "cloud", "ichimoku_cloud"],
+        "entity|object:holding_analysis": ["持仓", "holding", "position", "仓位", "持仓分析"],
+        "entity|object:jin10_data": ["金十", "jin10", "快讯", "宏观数据", "经济日历", "macro"],
+        "entity|concept:meta_knowledge": ["元知识", "六步法", "meta_knowledge", "思维模型", "推理链"],
+        "entity|object:balance_sheet": ["负债表", "balance_sheet", "财务数据", "财报"],
+        "entity|object:ecc_system": ["ECC", "本能系统", "置信度", "confid", "instinct"],
+        # Memory system components
+        "entity|object:prefetch": ["prefetch", "队列预取", "自动回忆", "auto_recall"],
+        "entity|object:sync_turn": ["sync_turn", "会话存储", "retain", "自动记录"],
+        "entity|object:dedup": ["dedup", "去重", "重复", "去重率"],
+        "entity|object:recall_tag": ["recall_tags", "标签过滤", "召回标签"],
+        "entity|object:amap": ["AMAP", "联想路由", "路由表", "图扩散"],
+        # Stock analysis system
+        "entity|object:backtest": ["回测", "backtest", "参数优化", "回溯验证"],
+        "entity|object:evaluation_framework": ["统一评估", "评分框架", "评估框架", "四维评分", "UnifiedEvaluator"],
+        "entity|object:feature_analysis": ["特征分析", "特征提取", "周线特征", "feature"],
+        "entity|object:scanner": ["扫描器", "scanner", "全市场", "批量扫描", "双通道", "动量追涨", "价值反转"],
+        "entity|object:watchlist": ["watchlist", "自选股", "增选股", "观察池"],
+        "entity|object:calibration": ["校准", "calibration", "反馈分析"],
+        # Report & chart
+        "entity|object:pdf_report": ["PDF", "报告生成", "推送", "报表"],
+        "entity|object:chart": ["图表", "chart", "K线图", "mplfinance", "可视化"],
+        "entity|object:feishu_push": ["飞书", "feishu", "lark", "消息推送", "卡片消息"],
+        # Infrastructure
+        "entity|object:mongodb": ["MongoDB", "mongodb", "数据库存储", "数据层"],
+        "entity|object:futu_opend": ["富途", "OpenD", "futu", "行情API"],
+        "entity|object:wiki": ["wiki", "LLM wiki", "llm-wiki", "知识库", "mkdocs"],
+        # Daily operations
+        "entity|object:cron_job": ["cron", "定时任务", "计划任务", "自动运行"],
+        "entity|object:health_check": ["健康检查", "巡检", "health_check", "audit"],
+        "entity|object:stock_holding": ["持仓股", "持有", "仓位管理", "金字塔加仓", "动态止损"],
+        # Cross-domain data sources
+        "entity|object:hibor_report": ["慧博", "研报", "hibor", "研报摘要"],
+        "entity|object:jin10_flash": ["快讯", "flash_news", "实时资讯"],
+    }
+
+    def _infer_entity_tags_from_content(self, content: str) -> list[str]:
+        """Auto-infer AMAP entity tags from content keywords."""
+        if not content:
+            return []
+        keywords_dict = self._amap_entity_keywords or HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS
+        content_lower = content.lower()
+        tags = []
+        for entity_tag, keywords in keywords_dict.items():
+            for kw in keywords:
+                if kw.lower() in content_lower:
+                    tags.append(entity_tag)
+                    break
+        return tags
+
+    def _basic_recall(self, query: str, limit: int = 10) -> list:
+        """Core recall call, returns raw results without expansion."""
+        recall_kwargs: dict = {
+            "bank_id": self._bank_id, "query": query,
+            "budget": self._budget, "max_tokens": self._recall_max_tokens,
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        try:
+            resp = self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs))
+            return list(resp.results) if resp and resp.results else []
+        except Exception as e:
+            logger.debug("_basic_recall failed: %s", e)
+            return []
+
+    def _tag_recall(self, tag: str, limit: int = 5, query: str = "") -> list:
+        """Tag-exact recall via tag_groups filter.
+
+        Uses hindsight API's tag_groups parameter for exact tag match,
+        unlike _basic_recall which does semantic vector search.
+        """
+        recall_kwargs: dict = {
+            "bank_id": self._bank_id, "query": query or "",
+            "budget": "low", "max_tokens": self._recall_max_tokens,
+            "tag_groups": [{"tags": [tag]}],
+        }
+        try:
+            resp = self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs))
+            return list(resp.results) if resp and resp.results else []
+        except Exception as e:
+            logger.debug("_tag_recall failed for tag=%s: %s", tag, e)
+            return []
+
+    def _try_amap_match(self, query: str) -> str | None:
+        """Check CORE memory AMAP routes + dynamic routes. Returns entity name if matched."""
+        query_lower = query.lower()
+        # 先查静态路由
+        for keyword, entity in self._AMAP_ROUTES.items():
+            if keyword.lower() in query_lower:
+                logger.debug("AMAP matched: '%s' → %s", keyword, entity)
+                return entity
+        # 再查动态路由
+        if self._AMAP_DYNAMIC_ROUTES:
+            for keyword, entity in self._AMAP_DYNAMIC_ROUTES.items():
+                if keyword.lower() in query_lower:
+                    logger.debug("AMAP dynamic matched: '%s' → %s", keyword, entity)
+                    return entity
+        return None
+
+    def _update_amap_routes(self) -> int:
+        """从 memory graph 自动发现路由，更新 _AMAP_DYNAMIC_ROUTES。
+
+        每10次 prefetch 调用一次，不阻塞。
+        Returns:
+            新增路由数
+        """
+        try:
+            self._memory_graph.build_from_hindsight()
+            routes = self._memory_graph.discover_routes(min_degree=2)
+            if not routes:
+                return 0
+
+            # 转成 keyword→entity dict，相同 keyword 取最高分
+            new_routes: dict[str, str] = {}
+            for r in routes:
+                kw = r["keyword"]
+                if kw not in new_routes:
+                    new_routes[kw] = r["entity"]
+
+            old_count = len(self._AMAP_DYNAMIC_ROUTES)
+            self._AMAP_DYNAMIC_ROUTES = new_routes
+            added = len(new_routes) - (old_count if old_count > 0 else 0)
+            logger.debug("AMAP dynamic routes updated: %d total, %d new",
+                         len(new_routes), added)
+            return max(0, added)
+        except Exception as e:
+            logger.debug("AMAP route discovery failed: %s", e)
+            return 0
+
+    @staticmethod
+    def _get_allowed_paths(mode: str) -> set:
+        """Get allowed relation path prefixes for the given mode."""
+        if mode == "task":
+            return {"depend", "guide", "contains"}
+        return {"impact", "suggest", "evolve", "cause", "depend", "guide", "contains"}
+
+    @staticmethod
+    def _extract_entities_from_results(results: list) -> dict:
+        """Extract entity|type:name and relation|prefix:target from recall results.
+
+        Scans each result's tags for entity/relation patterns.
+        Returns {entity_name: {type, relations: [{prefix, target}]}}
+        """
+        import re
+        entity_re = re.compile(r'^entity\|(\w+):(.+)$')
+        relation_re = re.compile(r'^relation\|(\w+):(.+)$')
+
+        entities: dict = {}
+        for r in results:
+            tags = getattr(r, 'tags', None) or []
+            if not tags:
+                # Try dict access
+                tags = r.get('tags', []) if isinstance(r, dict) else []
+            current_entity = None
+            current_relations = []
+            for tag in tags:
+                tag_s = str(tag)
+                m = entity_re.match(tag_s)
+                if m:
+                    current_entity = m.group(2)
+                    etype = m.group(1)
+                    if current_entity not in entities:
+                        entities[current_entity] = {"type": etype, "relations": []}
+                    continue
+                m = relation_re.match(tag_s)
+                if m:
+                    current_relations.append({
+                        "prefix": m.group(1),
+                        "target": m.group(2),
+                    })
+            if current_entity and current_relations and current_entity in entities:
+                entities[current_entity]["relations"].extend(current_relations)
+        return entities
+
+    @staticmethod
+    def _merge_and_rank(primary: list, expanded: list,
+                        max_results: int = 20) -> list:
+        """Merge primary + expanded results, dedup by text."""
+        seen_texts: set = set()
+        merged: list = []
+
+        def _get_text(item) -> str:
+            if hasattr(item, 'text'):
+                return item.text or ""
+            if isinstance(item, dict):
+                return item.get('text', item.get('content', ''))
+            return str(item)
+
+        for item in primary + expanded:
+            text = _get_text(item)
+            if text and text not in seen_texts:
+                seen_texts.add(text)
+                merged.append(item)
+                if len(merged) >= max_results:
+                    break
+        return merged
+
+    def _recall_with_expand(self, query: str, mode: str = "task",
+                            hops: int = 0, max_results: int = 20) -> list:
+        """Multi-hop graph expansion recall with mode switching.
+
+        Args:
+            query: User query string
+            mode: "task" (depend/guide/contains) or "innovation" (+impact/suggest)
+            hops: Expansion hops (0 = auto: task=2, innovation=3)
+            max_results: Max results to return
+
+        Returns:
+            List of memory dicts with expanded context
+        """
+        if hops <= 0:
+            hops = 2 if mode == "task" else 3
+
+        # Step 1: 1st hop - basic semantic recall
+        results = self._basic_recall(query, limit=min(10, max_results))
+        logger.debug("Recall expand[1st hop]: %d results for '%s'", len(results), query)
+
+        # Step 2: If few results, try AMAP route activation
+        if len(results) < 3:
+            amap_entity = self._try_amap_match(query)
+            if amap_entity:
+                logger.debug("Recall expand[AMAP]: routing to %s", amap_entity)
+                amap_results = self._tag_recall(amap_entity, limit=5)
+                results.extend(amap_results)
+
+        # Step 3: Extract entities from 1st-hop results
+        entities = self._extract_entities_from_results(results)
+        if not entities:
+            logger.debug("Recall expand: no entities found, returning 1st-hop results")
+            return results[:max_results]
+
+        # Step 4: Multi-hop expansion via relations
+        expanded: list = []
+        allowed_prefixes = self._get_allowed_paths(mode)
+        current_hops = min(hops - 1, 2)  # max 2 extra hops to avoid explosion
+
+        for _ in range(current_hops):
+            new_entities = {}
+            for entity_name, entity_info in entities.items():
+                for rel in entity_info.get("relations", []):
+                    if rel["prefix"] in allowed_prefixes:
+                        related = self._tag_recall(rel["target"], limit=3)
+                        for r in related:
+                            if r not in expanded:
+                                expanded.append(r)
+                        # Extract entities from related for next hop
+                        sub_entities = self._extract_entities_from_results(related)
+                        new_entities.update(sub_entities)
+
+            # Next hop uses newly discovered entities
+            if not new_entities:
+                break
+            entities = new_entities
+
+        logger.debug("Recall expand[expanded]: %d additional results from %d hops",
+                     len(expanded), current_hops)
+
+        # Step 5: Merge, dedup, rank
+        merged = self._merge_and_rank(results, expanded, max_results=max_results)
+        return merged
+
+    @staticmethod
+    def _compress_results(results: list, mode: str = "task") -> str:
+        """Apply compression rules: type priority, dedup, truncation.
+
+        Priority: concept > current-object > recent-event > scene > past-object
+
+        Returns:
+            Formatted string with compressed results (max 15 items).
+        """
+        if not results:
+            return ""
+
+        # Type priority order (lower = higher priority)
+        type_priority = {
+            "concept": 0, "fact": 1, "object": 2, "event": 3,
+            "scene": 4, "process": 5, "meta": 6, "affect": 7, "env": 8,
+        }
+
+        # Dedup by entity tag (same entity = keep first/latest)
+        seen_entities: set = set()
+        seen_texts: set = set()
+        ranked: list = []
+
+        for r in results:
+            text = getattr(r, 'text', '') or ''
+            if isinstance(r, dict):
+                text = r.get('text', r.get('content', ''))
+            if not text or text in seen_texts:
+                continue
+            seen_texts.add(text)
+
+            tags = getattr(r, 'tags', None) or []
+            if isinstance(r, dict):
+                tags = r.get('tags', [])
+
+            # Find entity tag for dedup
+            entity_tag = None
+            best_priority = 50  # default low priority
+            for t in tags:
+                ts = str(t)
+                if ts.startswith("entity|"):
+                    entity_tag = ts
+                    parts = ts.split("|", 1)
+                    if len(parts) > 1:
+                        etype = parts[1].split(":")[0]
+                        best_priority = type_priority.get(etype, 50)
+                    break
+
+            if entity_tag:
+                if entity_tag in seen_entities:
+                    continue
+                seen_entities.add(entity_tag)
+
+            ranked.append((best_priority, text, r))
+
+        # Sort by priority
+        ranked.sort(key=lambda x: x[0])
+
+        # Format output
+        lines = []
+        for priority, text, r in ranked[:15]:
+            if len(text) > 300 and mode == "task":
+                text = text[:300] + "..."
+            lines.append(f"- {text}")
+
+        return "\n".join(lines)
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
@@ -1192,7 +1585,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._mode = "disabled"
                 return
         self._api_key = self._config.get("apiKey") or self._config.get("api_key") or os.environ.get("HINDSIGHT_API_KEY", "")
-        default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
+        default_url = _DEFAULT_LOCAL_URL if self._mode in ("local_embedded", "local_external") else _DEFAULT_API_URL
         self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)
         self._llm_base_url = self._config.get("llm_base_url", "")
 
@@ -1212,10 +1605,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
         memory_mode = self._config.get("memory_mode", "hybrid")
-        self._memory_mode = memory_mode if memory_mode in {"context", "tools", "hybrid"} else "hybrid"
+        self._memory_mode = memory_mode if memory_mode in ("context", "tools", "hybrid") else "hybrid"
 
         prefetch_method = self._config.get("recall_prefetch_method") or self._config.get("prefetch_method", "recall")
-        self._prefetch_method = prefetch_method if prefetch_method in {"recall", "reflect"} else "recall"
+        self._prefetch_method = prefetch_method if prefetch_method in ("recall", "reflect") else "recall"
 
         # Bank options
         self._bank_mission = self._config.get("bank_mission", "")
@@ -1227,7 +1620,7 @@ class HindsightMemoryProvider(MemoryProvider):
             or os.environ.get("HINDSIGHT_RETAIN_TAGS", "")
         )
         self._tags = self._retain_tags or None
-        self._recall_tags = self._config.get("recall_tags") or None
+        self._recall_tags = _normalize_retain_tags(self._config.get("recall_tags")) or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
@@ -1251,6 +1644,28 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
+
+        # AMAP entity keywords: merge config overrides on top of defaults
+        config_keywords = self._config.get("amap_entity_keywords", {})
+        if config_keywords and isinstance(config_keywords, dict):
+            base = dict(HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS)
+            base.update(config_keywords)
+            self._amap_entity_keywords = base
+        else:
+            self._amap_entity_keywords = dict(HindsightMemoryProvider._AMAP_ENTITY_KEYWORDS)
+
+        # Also merge from config.yaml hindsight.amap_entity_keywords
+        try:
+            import yaml
+            yaml_path = get_hermes_home() / "config.yaml"
+            if yaml_path.exists():
+                yaml_cfg = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+                yaml_kw = (yaml_cfg or {}).get("hindsight", {}).get("amap_entity_keywords")
+                if yaml_kw and isinstance(yaml_kw, dict):
+                    self._amap_entity_keywords.update(yaml_kw)
+                    logger.debug("AMAP: merged %d entity keywords from config.yaml", len(yaml_kw))
+        except Exception as exc:
+            logger.debug("AMAP: config.yaml merge skipped (%s)", exc)
 
         _client_version = "unknown"
         try:
@@ -1285,7 +1700,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     # would capture output from other threads.
                     import hindsight_embed.daemon_embed_manager as dem
                     from rich.console import Console
-                    dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
+                    dem.console = Console(file=open(log_path, "a"), force_terminal=False)
 
                     client = self._get_client()
                     profile = self._config.get("profile", "hermes")
@@ -1301,15 +1716,15 @@ class HindsightMemoryProvider(MemoryProvider):
                     if config_changed:
                         profile_env = _materialize_embedded_profile_env(self._config)
                         if client._manager.is_running(profile):
-                            with open(log_path, "a", encoding="utf-8") as f:
+                            with open(log_path, "a") as f:
                                 f.write("\n=== Config changed, restarting daemon ===\n")
                             client._manager.stop(profile)
 
                     client._ensure_started()
-                    with open(log_path, "a", encoding="utf-8") as f:
+                    with open(log_path, "a") as f:
                         f.write("\n=== Daemon started successfully ===\n")
                 except Exception as e:
-                    with open(log_path, "a", encoding="utf-8") as f:
+                    with open(log_path, "a") as f:
                         f.write(f"\n=== Daemon startup failed: {e} ===\n")
                         traceback.print_exc(file=f)
 
@@ -1321,18 +1736,14 @@ class HindsightMemoryProvider(MemoryProvider):
             return (
                 f"# Hindsight Memory\n"
                 f"Active (context mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
-                f"Relevant memories are automatically injected into context.\n"
-                f"【知识提示】wiki/docs/topics/ 下有历史分析结论和读书笔记，"
-                f"涉及技术/宏观/个股等问题时，先用知识路由(knowledge_router)查证再回答。"
+                f"Relevant memories are automatically injected into context."
             )
         if self._memory_mode == "tools":
             return (
                 f"# Hindsight Memory\n"
                 f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
                 f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-                f"hindsight_retain to store facts.\n"
-                f"【知识提示】wiki/docs/topics/ 下有历史分析结论和读书笔记，"
-                f"涉及技术/宏观/个股等问题时，先用知识路由(knowledge_router)查证再回答。"
+                f"hindsight_retain to store facts."
             )
         return (
             f"# Hindsight Memory\n"
@@ -1340,8 +1751,8 @@ class HindsightMemoryProvider(MemoryProvider):
             f"Relevant memories are automatically injected into context. "
             f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
             f"hindsight_retain to store facts.\n"
-            f"【知识提示】wiki/docs/topics/ 下有历史分析结论和读书笔记，"
-            f"涉及技术/宏观/个股等问题时，先用知识路由(knowledge_router)查证再回答。"
+            f"Recall supports mode='task' (default, focused) or mode='innovation' (broad associations). "
+            f"Set mode='innovation' for cross-domain discovery."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -1362,186 +1773,204 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    # ── 艾宾浩斯时间衰减重排序 ──
     @staticmethod
-    def _read_calibration() -> str:
-        """读取 calibration.md，返回裸文本（无包装）。
+    def _rerank_with_time_decay(results, halflife_days: int = 60):
+        """对RecallResults做混合排序：60%语义相关(按position) + 40%艾宾浩斯时间衰减。
 
-        calibration.md 由 memory_manager._write_calibration() 在每轮对话同步后写入，
-        包含 gateway 状态、错误数、最近 cron 结果等外部系统信息。
+        Returns:
+            List of (hybrid_score, decay, age_days, text, original_item)
+            按 hybrid_score 降序排列。
         """
-        try:
-            path = os.path.expanduser("~/.hermes/hermes-agent/agent/calibration.md")
-            if not os.path.exists(path):
-                return ""
-            with open(path) as f:
-                text = f.read().strip()
-            return text
-        except Exception:
-            return ""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        n = len(results)
+        scored = []
+        for i, r in enumerate(results):
+            if not r.text:
+                continue
+            # 语义相关度代理：API返回顺序=相关度降序
+            position_weight = 1.0 - (i / max(n - 1, 1)) * 0.8 if n > 1 else 1.0
 
-    def prefetch_layered(self, query: str, *, session_id: str = "") -> Dict[str, str]:
-        """返回校准上下文（CRITICAL 层，≤200 字符）。
+            # 艾宾浩斯时间衰减
+            ts_str = r.occurred_start or r.mentioned_at
+            age_days = 0
+            if ts_str:
+                try:
+                    clean_ts = ts_str.replace("Z", "+00:00")
+                    ts = datetime.fromisoformat(clean_ts)
+                    age_days = (now - ts).days
+                except (ValueError, TypeError):
+                    pass
+            decay = max(0.05, 2.0 ** (-age_days / halflife_days))
 
-        校准数据来源：上一轮结束后 queue_prefetch 启动的知识路由。
-        知识路由基于上一轮用户消息搜索 hindsight 记忆 + wiki + 实体图 + skill。
-        提取时优先用本地 0.5B LLM 做摘要，失败则回退到文本规则提取。
+            # 混合分：60%语义 + 40%时间
+            score = position_weight * 0.6 + decay * 0.4
+            scored.append((score, decay, age_days, r.text, r))
 
-        如果是首轮（线程未跑过），返回空。
+        scored.sort(key=lambda x: -x[0])
+        return scored
+
+    @staticmethod
+    def _dedup_normalize(text: str) -> str:
+        """归一化去重用文本：去后缀、去冠词、归一化日期、去标点空格。
+
+        返回纯小写归一化字符串，用于编辑距离比较。
         """
-        # 1. 等后台线程完成
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            logger.debug("Calibration: waiting for knowledge_router background thread")
-            self._prefetch_thread.join(timeout=15.0)
+        s = text.strip()
+        # 1. 剥离 "| When:", "| Involving:", " | 时间:" 等附属后缀
+        s = re.split(
+            r"\s*\|\s*(?:When|Involving|时间)\s*[:：]\s*",
+            s, maxsplit=1
+        )[0].strip()
+        # 2. 剥离 " | 2026年X月X日" 尾巴
+        s = re.sub(r"\s*\|\s*\d{4}年\d{1,2}月\d{1,2}日.*", "", s).strip()
+        # 2.5 去除反引号（`code` → code）
+        s = s.replace("`", "")
+        # 3. 统一日期格式: "May 09" → "may 9", "May 9" → "may 9"
+        s = re.sub(r"(\d{4}[-/])(\d{1,2})([-/]\d{1,2})",
+                   lambda m: m.group(1) + str(int(m.group(2))) + m.group(3), s)
+        s = re.sub(r"(may|jun|jul|aug|sep|oct|nov|dec)\s+0+(\d)",
+                   lambda m: m.group(1) + " " + m.group(2), s, flags=re.I)
+        s = re.sub(r"(may|jun|jul|aug|sep|oct|nov|dec)\s+(\d+)",
+                   lambda m: m.group(1).lower() + " " + str(int(m.group(2))), s, flags=re.I)
+        # 4. 去掉句首冠词
+        s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I)
+        # 5. 折叠空白、转小写
+        s = re.sub(r"\s+", " ", s).lower().strip()
+        return s
 
-        # 2. 取原始路由输出（已存成 plain text，不是节段格式）
-        with self._prefetch_lock:
-            raw = self._prefetch_raw
-            self._prefetch_raw = ""
+    def _dedup_results(self, scored: list) -> list:
+        """去除内容重复的记忆（精确+模糊），保留时间衰减加权后分数最高的版本。
 
-        if not raw:
-            return {}
+        两层去重：
+        1. 精确去重（归一化后字符串完全一致）
+        2. 模糊去重（编辑距离 >0.80，内容实质相同但措辞稍异）
 
-        # 3. 一次提取校准摘要（LLM → 文本规则 fallback）
-        calibrated = self._extract_router_calibration(raw, max_chars=200)
-        if calibrated:
-            logger.debug(
-                "Calibration: %d chars extracted", len(calibrated),
-            )
-            return {self.LAYER_CRITICAL: calibrated}
-        return {}
+        重复来源：daily-summary 自动留存会存同一事件多种措辞的版本，
+        以及 hindsight 知识图自动生成的冗余描述。
 
-    _calibration_llm = None  # 类级别缓存，懒加载
-
-    def _get_calibration_llm(self):
-        """懒加载本地校准模型（qwen2.5-0.5b-instruct Q4_K_M）。"""
-        if self.__class__._calibration_llm is not None:
-            return self.__class__._calibration_llm
-
-        model_path = "/home/john/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-        if not os.path.exists(model_path):
-            logger.debug("Calibration LLM: model file not found at %s", model_path)
-            self.__class__._calibration_llm = False
-            return None
-
-        try:
-            from llama_cpp import Llama
-            llm = Llama(
-                model_path=model_path,
-                n_ctx=512,
-                n_threads=4,
-                n_gpu_layers=0,
-                verbose=False,
-            )
-            self.__class__._calibration_llm = llm
-            logger.debug("Calibration LLM: loaded (%.1f MB, 0.5B)", os.path.getsize(model_path) / 1e6)
-            return llm
-        except Exception as e:
-            logger.debug("Calibration LLM: load failed: %s", e)
-            self.__class__._calibration_llm = False
-            return None
-
-    def _extract_router_calibration(
-        self, raw: str, max_chars: int = 200,
-    ) -> str:
-        """从 knowledge_router 输出中提取校准摘要（≤200字符）。
-
-        优先用本地 0.5B LLM 做紧凑摘要，失败则回退文本规则提取。
-
-        路由的输出结构：
-         🧠 [hindsight]  — 语义记忆回忆
-         🗂️ [wiki]       — 知识库匹配
-         🔗 [graph]      — 实体图关联
-         🧰 [skill]      — 技能推荐
+        Returns:
+            去重后的 list，格式不变，按原顺序排列。
         """
-        if not raw:
-            return ""
+        from difflib import SequenceMatcher
 
-        # ── 1. LLM 摘要（优先） ──────────────────────────────────────
-        llm = self._get_calibration_llm()
-        if llm:
-            try:
-                out = llm.create_chat_completion(
-                    messages=[{
-                        "role": "user",
-                        "content": (
-                            f"将以下信息压缩为一句话校准摘要（≤{max_chars}字符），"
-                            "保留关键实体、结论和因果关系。"
-                            "只输出一行，不加任何说明。\n\n"
-                            f"{raw[:1500]}"
-                        ),
-                    }],
-                    max_tokens=60,
-                    temperature=0,
-                )
-                text = out["choices"][0]["message"]["content"].strip()
-                # 去掉可能的引号/前缀
-                text = text.strip("「」\"''\n")
-                if text:
-                    return text[:max_chars]
-            except Exception as e:
-                logger.debug("Calibration LLM: inference failed: %s", e)
+        deduped: list = []
+        seen_exact: set = set()      # 精确去重 key
+        kept_norms: list[tuple[str, tuple]] = []  # (norm_text, item) 用于模糊比较
 
-        # ── 2. 文本规则提取（fallback） ──────────────────────────────
-        sections: dict[str, list[str]] = {
-            "hindsight": [], "wiki": [], "graph": [], "skill": [],
-        }
-        current = None
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if "[hindsight]" in stripped:
-                current = sections["hindsight"]
-                continue
-            elif "[wiki]" in stripped:
-                current = sections["wiki"]
-                continue
-            elif "[graph]" in stripped:
-                current = sections["graph"]
-                continue
-            elif "[skill]" in stripped:
-                current = sections["skill"]
-                continue
-            if current is not None and not stripped.startswith(("📌", "🏷️", "📊")):
-                current.append(stripped)
+        _FUZZY_THRESHOLD = 0.80
 
-        parts = []
-        # hindsight
-        for h in sections["hindsight"]:
-            text = h.strip()
-            if text and not text.startswith("rel="):
-                parts.append(f"🧠{text[:80]}")
-                break
-        # wiki
-        for w in sections["wiki"]:
-            text = w.strip()
-            if text and not text.startswith("rel="):
-                parts.append(f"🗂️{text[:60]}")
-                break
-        # skill
-        for s in sections["skill"]:
-            clean = s.lstrip("🧰 ").strip()
-            if clean.startswith("技能:"):
-                name = clean[len("技能:"):].strip()
-                parts.append(f"🧰{name[:40]}")
-                break
-        # graph（关联记忆优先，实体名次之）
-        graph_found = False
-        for g in sections["graph"]:
-            if g.startswith("关联记忆:"):
-                mem = g[len("关联记忆:"):].strip()
-                parts.append(f"🔗{mem[:80]}")
-                graph_found = True
-                break
-        if not graph_found:
-            for g in sections["graph"]:
-                if g.startswith("关联实体:"):
-                    ent = g[len("关联实体:"):].strip()
-                    parts.append(f"🔗{ent[:30]}")
+        for item in scored:
+            text = item[3]
+            norm = self._dedup_normalize(text)
+
+            # ── 第一层：精确去重（归一化后全等）──
+            if norm not in seen_exact:
+                seen_exact.add(norm)
+
+                # ── 第二层：模糊去重 ──
+                # 先做快速预检，再算编辑距离
+                is_fuzzy_dup = False
+                for kept_norm, kept_item in kept_norms:
+                    # 策略1: 子串包含（短⊂长）——一个被另一个完全包含，铁定重复
+                    shorter, longer = (norm, kept_norm) if len(norm) < len(kept_norm) else (kept_norm, norm)
+                    if shorter in longer:
+                        is_fuzzy_dup = True
+                    else:
+                        # 策略2: 编辑距离——用长度比归一化后的相似度
+                        # 快速预检：长度差 >50% 直接跳过（不是重复）
+                        max_len = max(len(norm), len(kept_norm))
+                        if max_len > 0 and abs(len(norm) - len(kept_norm)) / max_len > 0.50:
+                            continue
+                        ratio = SequenceMatcher(None, norm, kept_norm).ratio()
+                        if ratio > _FUZZY_THRESHOLD:
+                            is_fuzzy_dup = True
+
+                    if is_fuzzy_dup:
+                        # 模糊重复：保留分数更高的那个
+                        if item[0] > kept_item[0]:
+                            # 当前项分数更高 → 替换
+                            for k, (kn, ki) in enumerate(kept_norms):
+                                if ki is kept_item:
+                                    kept_norms[k] = (kn, item)
+                                    break
+                            for k, existing in enumerate(deduped):
+                                if existing is kept_item:
+                                    deduped[k] = item
+                                    break
+                        break
+
+                if not is_fuzzy_dup:
+                    kept_norms.append((norm, item))
+                    deduped.append(item)
+
+        removed = len(scored) - len(deduped)
+        if removed > 0:
+            logger.debug("Dedup: removed %d duplicates (exact+fuzzy), %d → %d items",
+                         removed, len(scored), len(deduped))
+        return deduped
+
+    def _scene_filter_results(self, scored: list, query: str) -> list:
+        """场景隔离重排序：检测查询场景，同场景结果优先。
+
+        Args:
+            scored: _rerank_with_time_decay 的输出
+            query: 用户查询
+
+        Returns:
+            重排序后的列表（同场景靠前）或完整列表（无场景时）
+        """
+        scene = self._infer_scene(query)
+        if not scene:
+            return scored  # 没有检测到场景，返回原始结果
+
+        same_scene = []
+        other_scene = []
+        no_scene = []
+
+        for item in scored:
+            if len(item) < 5:
+                no_scene.append(item)
+                continue
+            original = item[4]  # recall result object
+            tags = getattr(original, 'tags', None) or []
+            if not tags and isinstance(original, dict):
+                tags = original.get('tags', [])
+
+            found = False
+            for tag in tags:
+                ts = str(tag)
+                if ts == scene:
+                    same_scene.append(item)
+                    found = True
                     break
+            if not found:
+                # 检查是否包含其他场景标签
+                has_other_scene = False
+                for tag in tags:
+                    ts = str(tag)
+                    if ts in self._SCENE_KEYWORDS:
+                        other_scene.append(item)
+                        has_other_scene = True
+                        break
+                if not has_other_scene:
+                    no_scene.append(item)
 
-        result = "|".join(parts)
-        return result[:max_chars]
+        # 场景可见度：同场景返回前 80%，异场景压缩到前 30%，无场景保留前 50%
+        max_same = max(1, len(same_scene))
+        max_other = max(1, len(other_scene) // 3) if other_scene else 0
+        max_none = max(1, len(no_scene) // 2) if no_scene else 0
+
+        result = (same_scene[:max_same]
+                  + no_scene[:max_none]
+                  + other_scene[:max_other])
+
+        if result != scored:
+            logger.debug("Scene filter [%s]: %d same, %d other→%d, %d none→%d → %d total",
+                         scene, len(same_scene), len(other_scene), max_other,
+                         len(no_scene), max_none, len(result))
+        return result if result else scored
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
@@ -1558,41 +1987,296 @@ class HindsightMemoryProvider(MemoryProvider):
             query = query[:self._recall_max_input_chars]
 
         def _run():
-            """背景线程：跑知识路由（联想记忆+wiki+skill），存原始输出供 prefetch 提取。"""
-            import subprocess
             try:
-                _q = query.strip()
-                if not _q:
-                    return
-                router_script = os.path.expanduser(
-                    "~/.hermes/scripts/knowledge_router.py"
-                )
-                proc = subprocess.run(
-                    ["python3", router_script, _q, "--all"],
-                    capture_output=True, text=True, timeout=25,
-                )
-                raw = proc.stdout or ""
-                if not raw:
-                    logger.debug("Calibration: knowledge_router returned empty")
-                    return
+                if self._prefetch_method == "reflect":
+                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                    text = resp.text or ""
+                else:
+                    recall_kwargs: dict = {
+                        "bank_id": self._bank_id, "query": query,
+                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
+                    }
+                    if self._recall_tags:
+                        recall_kwargs["tags"] = self._recall_tags
+                        recall_kwargs["tags_match"] = self._recall_tags_match
+                    if self._recall_types:
+                        recall_kwargs["types"] = self._recall_types
+                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
+                                 self._bank_id, len(query), self._budget)
+                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+                    num_results = len(resp.results) if resp.results else 0
+                    logger.debug("Prefetch: recall returned %d results", num_results)
+                    # 艾宾浩斯时间衰减重排序
+                    scored = self._rerank_with_time_decay(resp.results or [])
+                    # 去重：daily-summary 重复记忆，保留分数最高版本
+                    scored = self._dedup_results(scored)
+                    # 场景隔离重排序：检测查询场景，同场景结果优先
+                    scored = self._scene_filter_results(scored, query)
+                    # ── P0/P1/P2/P3 分级过滤 ──
+                    # P0: entity|object 标签 → 全量保留（高价值，通常带 AMAP 实体映射）
+                    # P1: 纯 auto_retain（无 entity|object）→ 最多 3 条（备查即可）
+                    # P2: 其它（非 skill 非 auto）→ 正常保留
+                    # P3: skill 日常更新类 → 压缩为摘要，保留实体+动作+时间
+                    try:
+                        import re
+                        p0, p1_auto, p2_other, p3 = [], [], [], []
+                        for s in scored:
+                            content = s[3] if len(s) > 3 else ""
+                            tags = s[4] if len(s) > 4 else []
+                            has_entity_obj = any(str(t).startswith("entity|object:") for t in tags)
+                            has_auto_retain = any("entity|concept:auto_retain" in str(t) for t in tags)
+                            is_skill = any(kw in content.lower() for kw in
+                                           ["skill update", "skill library", "skills 更新"])
+                            if has_entity_obj:
+                                p0.append(s)      # P0: 高价值
+                            elif has_auto_retain and not has_entity_obj:
+                                p1_auto.append(s)  # P1: 纯 auto_retain，限流
+                            elif is_skill:
+                                p3.append(s)       # P3: skill 更新
+                            else:
+                                p2_other.append(s) # P2: 其他有价值内容
+                        # P1: auto_retain 最多保留 5 条
+                        auto_cap = min(len(p1_auto), 5)
+                        if len(p1_auto) > 5:
+                            logger.debug("Prefetch P1(auto_retain): capped %d→5", len(p1_auto))
+                        p1_capped = p1_auto[:5]
+                        # 压缩 P3：提取核心事实，不丢 who/when
+                        if p3:
+                            old_count = len(p3)
+                            seen_fingerprint = set()
+                            p3_compressed = []
+                            for s in p3:
+                                content = s[3]
+                                # 提取核心事实：取 "| When:" 之前的部分作为key
+                                # 格式: "<实体> <动作> <详情> | When: <日期> | Involving: <谁>"
+                                core_part = content.split("| When:")[0].split("| 时间:")[0].strip()
+                                # 规范化fingerprint用于去重
+                                fp = re.sub(r'\s+', ' ', core_part.lower())[:50]
+                                if fp not in seen_fingerprint:
+                                    seen_fingerprint.add(fp)
+                                    # 核心事实完整保留，不需要截断
+                                    p3_compressed.append(
+                                        (s[0], s[1] * 0.6, s[2], core_part,
+                                         s[4] if len(s) > 4 else [])
+                                    )
+                            logger.debug("Prefetch P0/P1/P2/P3: P0=%d P1=%d→%d P2=%d P3=%d→%d",
+                                         len(p0), len(p1_auto), len(p1_capped),
+                                         len(p2_other), old_count, len(p3_compressed))
+                            scored = p0 + p1_capped + p2_other + p3_compressed
+                        else:
+                            logger.debug("Prefetch P0/P1/P2/P3: P0=%d P1=%d→%d P2=%d P3=0",
+                                         len(p0), len(p1_auto), len(p1_capped), len(p2_other))
+                    except Exception as e:
+                        logger.debug("Prefetch P0/P1/P2/P3 grading failed, using raw results: %s", e)
+                    text = "\n".join(f"- {s[3]}" for s in scored) if scored else ""
 
-                # 存原始输出，prefetch_layered 做一次提取即可（避免二次提取 bug）
-                with self._prefetch_lock:
-                    self._prefetch_raw = raw
-                logger.debug(
-                    "Calibration: %d chars raw from knowledge_router stored",
-                    len(raw),
-                )
-            except subprocess.TimeoutExpired:
-                logger.debug("Calibration: knowledge_router timed out (15s)")
+                # ── PPR 图扩散扩展 ──
+                if self._prefetch_method != "reflect":
+                    try:
+                        # 每10次 prefetch 刷新一次动态路由
+                        self._AMAP_DYNAMIC_PREFETCH_COUNT += 1
+                        if self._AMAP_DYNAMIC_PREFETCH_COUNT % 10 == 0:
+                            self._update_amap_routes()
+
+                        # Build seed nodes from AMAP + recall results
+                        seed_nodes = []
+                        amap_entity = self._try_amap_match(query)
+                        if amap_entity:
+                            seed_nodes.append(amap_entity)
+
+                        # 从语义召回结果中提取 entity 标签作为种子
+                        if resp and resp.results:
+                            for r in resp.results[:5]:
+                                for tag in (getattr(r, 'tags', None) or []):
+                                    ts = str(tag)
+                                    if ts.startswith("entity|"):
+                                        if ts not in seed_nodes:
+                                            seed_nodes.append(ts)
+
+                        if seed_nodes:
+                            # 构建/刷新图
+                            n_nodes = self._memory_graph.build_from_hindsight()
+                            logger.debug("Prefetch PPR: graph has %d nodes, seeds=%s",
+                                         n_nodes, seed_nodes[:3])
+
+                            # PPR 扩散
+                            expanded = self._memory_graph.get_expanded_nodes(
+                                seed_nodes, top_k=5, min_score=0.005)
+
+                            if expanded:
+                                extra_lines = []
+                                for node, score in expanded:
+                                    tag_results = self._tag_recall(node, limit=2)
+                                    for r in tag_results:
+                                        if r.text:
+                                            extra_lines.append(
+                                                f"- [关联:{score:.2f}] {r.text}")
+                                if extra_lines:
+                                    extra_text = "\n".join(extra_lines[:8])
+                                    if text:
+                                        text = text + "\n# 联想记忆扩展\n" + extra_text
+                                    else:
+                                        text = "# 联想记忆扩展\n" + extra_text
+                                    logger.debug("Prefetch PPR: added %d expanded memories",
+                                                 len(extra_lines))
+                    except Exception as ppr_e:
+                        logger.debug("Prefetch PPR expand failed: %s", ppr_e, exc_info=True)
+
+                if text:
+                    # ── 文本去重（精确+模糊近义） ──
+                    lines = text.split("\n")
+                    seen_exact = set()
+                    seen_norm = set()  # 归一化指纹→原内容映射
+                    deduped = []
+                    dedup_exact = 0
+                    dedup_fuzzy = 0
+
+                    def _normalize(s: str) -> str:
+                        """归一化：去前缀、降维、去停用词、取前40字符指纹"""
+                        s = s.strip()
+                        # 去掉常见前缀行标记
+                        for p in ("- ", "# 联想记忆扩展", "[去重:", "# "):
+                            if s.startswith(p):
+                                s = s[len(p):].lstrip()
+                        # 去掉行首 [关联:0.85] / [截断:...] 等标记
+                        import re
+                        s = re.sub(r'^\[.*?\]\s*', '', s)
+                        s = s.lower().strip()
+                        # 去掉句首冠词
+                        for art in ("the ", "a ", "an ", "this ", "that "):
+                            if s.startswith(art):
+                                s = s[len(art):]
+                        # 去掉标点
+                        s = re.sub(r'[^\w\s]', '', s)
+                        # 压缩空格
+                        s = ' '.join(s.split())
+                        # 取前40字符作为指纹
+                        return s[:40]
+
+                    for line in lines:
+                        content = line.lstrip("- ").lstrip()
+                        # 保留空行和标题行
+                        if not content.strip() or content.startswith("#"):
+                            deduped.append(line)
+                            continue
+                        # 第1层：精确去重
+                        if content in seen_exact:
+                            dedup_exact += 1
+                            continue
+                        seen_exact.add(content)
+                        # 第2层：归一化近义去重
+                        norm = _normalize(content)
+                        if norm and norm in seen_norm:
+                            dedup_fuzzy += 1
+                            continue
+                        seen_norm.add(norm)
+                        deduped.append(line)
+
+                    total_dedup = dedup_exact + dedup_fuzzy
+                    if total_dedup > 0:
+                        logger.debug("Prefetch dedup: exact=%d fuzzy=%d total=%d → %d lines left",
+                                     dedup_exact, dedup_fuzzy, total_dedup, len(deduped))
+                        if deduped:
+                            deduped.append(f"[去重: 移除 {total_dedup} 条(精确{dedup_exact}+模糊{dedup_fuzzy})]")
+                        text = "\n".join(deduped)
+
+                    # ── token 预算截断 ──
+                    # 防止 prefetch 结果超长注入 context
+                    max_chars = self._recall_max_tokens * 4  # 中文约 1 token/2 chars, 保守估 1/4
+                    if len(text) > max_chars:
+                        lines = text.split("\n")
+                        # 先尝试截断 PPR 扩展部分（优先保留核心 recall 结果）
+                        ppr_idx = None
+                        for i, line in enumerate(lines):
+                            if line.strip().startswith("# 联想记忆扩展"):
+                                ppr_idx = i
+                                break
+                        if ppr_idx is not None and len(text) > max_chars:
+                            # 截断 PPR 部分
+                            core = lines[:ppr_idx]
+                            ext = lines[ppr_idx:]
+                            # 从后往前删 PPR 行
+                            while len("\n".join(core + [""] + ext)) > max_chars and len(ext) > 1:
+                                ext.pop()
+                            if len("\n".join(core + [""] + ext)) > max_chars:
+                                # 如果还超，截断核心结果
+                                while len("\n".join(core)) > max_chars * 0.7 and len(core) > 3:
+                                    core.pop()
+                                lines = core
+                                if ext:
+                                    lines.extend(ext)
+                            else:
+                                lines = core + ext
+                        else:
+                            # 没有 PPR，直接截断核心结果行
+                            while len("\n".join(lines)) > max_chars and len(lines) > 3:
+                                lines.pop()
+                        if len(lines) < len(text.split("\n")):
+                            truncated = len(text.split("\n")) - len(lines)
+                            lines.append(f"[截断: 省略 {truncated} 行]\n")
+                        text = "\n".join(lines)
+
+                    with self._prefetch_lock:
+                        self._prefetch_result = text
             except Exception as e:
-                logger.debug(
-                    "Calibration: knowledge_router failed: %s", e, exc_info=True,
-                )
+                logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 
-        self._prefetch_thread = threading.Thread(
-            target=_run, daemon=True, name="hindsight-calibration",
-        )
+            # ── Also fetch latest summaries for cross-session continuity ──
+            try:
+                summary_kwargs: dict = {
+                    "bank_id": self._bank_id, "query": "",
+                    "budget": "low", "max_tokens": 3000,
+                    "tags": ["session-summary", "daily-summary"],
+                    "tags_match": "any",
+                }
+                s_resp = self._run_hindsight_operation(
+                    lambda client: client.arecall(**summary_kwargs)
+                )
+                if s_resp and s_resp.results:
+                    s_lines = [f"- {r.text}" for r in s_resp.results[:3] if r.text]
+                    if s_lines:
+                        s_text = "\n".join(s_lines)
+                        with self._prefetch_lock:
+                            if self._prefetch_result:
+                                self._prefetch_result = s_text + "\n\n" + self._prefetch_result
+                            else:
+                                self._prefetch_result = s_text
+                        logger.debug("Prefetch: appended %d session-summaries", len(s_lines))
+            except Exception as e:
+                logger.debug("Session-summary prefetch failed: %s", e, exc_info=True)
+
+            # ── Also fetch recent entity-tagged memories for cross-session continuity ──
+            try:
+                entity_kwargs: dict = {
+                    "bank_id": self._bank_id, "query": "",
+                    "budget": "low", "max_tokens": 1000,
+                    "tags": ["entity|object", "entity|concept"],
+                    "tags_match": "any",
+                }
+                e_resp = self._run_hindsight_operation(
+                    lambda client: client.arecall(**entity_kwargs)
+                )
+                if e_resp and e_resp.results:
+                    e_lines = []
+                    for r in e_resp.results[:5]:
+                        tags = r.tags or []
+                        for t in tags:
+                            if t.startswith("entity|") or t.startswith("relation|"):
+                                e_lines.append(f"• [{t}] {r.text[:80]}")
+                                break
+                    if e_lines:
+                        e_text = "\n".join(e_lines)
+                        with self._prefetch_lock:
+                            if self._prefetch_result:
+                                self._prefetch_result += "\n\n" + e_text
+                            else:
+                                self._prefetch_result = e_text
+                        logger.debug("Prefetch: appended %d entity-tagged memories", len(e_lines))
+            except Exception as e:
+                logger.debug("Entity-tagged prefetch failed: %s", e, exc_info=True)
+
+        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
@@ -1667,6 +2351,72 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["tags"] = merged_tags
         return kwargs
 
+    # ── 质量门禁：避免低价值对话轮次存入长期记忆 ──
+    # 当前 auto_retain 的主要噪声来源是纯确认语、单字符回复、无信息量的问候
+    # 此处用轻量启发式规则过滤，不做 LLM 调用
+    _RETAIN_QUALITY_MIN_LENGTH = 60
+    _RETAIN_QUALITY_INFO_MARKERS = [
+        # 用户决策/行为
+        "决定", "采用", "选择", "改成", "改为", "换用", "替代", "替换",
+        # 分析/评估
+        "分析", "评估", "报告", "对比", "回测", "验证", "检查", "检测",
+        # 代码/配置/部署
+        "代码", "修改", "修复", "配置", "部署", "commit", "merge", "patch",
+        "git", "ssh", "config", "docker", "npm", "pip", "uv",
+        "max_tokens", "recall", "auto_retain", "recall_tags",
+        # 股票
+        "持仓", "买入", "卖出", "止损", "加仓", "涨停", "跌停",
+        "ADX", "BOLL", "金叉", "死叉", "支撑", "压力", "突破",
+        # 工具调用结果
+        "报错", "错误", "失败", "成功", "完成", "结果",
+        "Traceback", "Error", "Exception",
+    ]
+    _RETAIN_QUALITY_LOW_VALUE_USER = {
+        "", ".", "?", "？", "。", "！", "~", "好", "嗯", "ok",
+        "在吗", "在？", "继续",
+    }
+
+    def _check_retain_quality(self, user_content: str, assistant_content: str) -> bool:
+        """判断本轮对话内容是否值得持久化到 Hindsight 记忆库。
+
+        启发式规则（无 LLM 调用）：
+        1. 用户消息是单字符/问候/确认语 → 跳过
+        2. 总长度 < 60 字符且无信息标记 → 跳过
+        3. 包含信息标记（分析/修复/代码/报错/持仓等）→ 保留
+        4. 总长度 > 150 字符 → 保留（可能有隐含信息）
+        5. 默认：保守保留（宁可多存不漏存）
+        """
+        clean_user = user_content.strip().rstrip(".!！。？?~")
+        clean_asst = assistant_content.strip().rstrip(".!！。？?~")
+
+        # 规则1：空内容
+        if not clean_user and not clean_asst:
+            return False
+
+        # 规则2：用户消息是低价值内容
+        if clean_user.lower() in self._RETAIN_QUALITY_LOW_VALUE_USER:
+            return False
+
+        total_len = len(clean_user) + len(clean_asst)
+
+        # 规则3：包含信息标记 → 保留
+        user_lower = clean_user.lower()
+        asst_lower = clean_asst.lower()
+        has_info = any(m in user_lower or m in asst_lower
+                       for m in self._RETAIN_QUALITY_INFO_MARKERS)
+        if has_info:
+            return True
+
+        # 规则4：总长度小于阈值且无信息 → 跳过
+        if total_len < self._RETAIN_QUALITY_MIN_LENGTH:
+            return False
+
+        # 规则5：足够长 → 保留
+        if total_len > 150:
+            return True
+
+        return True  # 默认保守
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue a retain for the current turn. Non-blocking.
 
@@ -1699,11 +2449,23 @@ class HindsightMemoryProvider(MemoryProvider):
                      len(self._session_turns), sum(len(t) for t in self._session_turns))
         content = "[" + ",".join(self._session_turns) + "]"
 
-        lineage_tags: list[str] = []
+        all_tags: list[str] = []
         if self._session_id:
-            lineage_tags.append(f"session:{self._session_id}")
+            all_tags.append(f"session:{self._session_id}")
         if self._parent_session_id:
-            lineage_tags.append(f"parent:{self._parent_session_id}")
+            all_tags.append(f"parent:{self._parent_session_id}")
+
+        # TiMEM P1: auto-infer scene and inject as tag
+        scene_tag = self._infer_scene(content)
+        if scene_tag and scene_tag not in all_tags:
+            all_tags.append(scene_tag)
+
+        # P3.1: Auto-infer AMAP entity tags from content
+        if "--no-auto-entity" not in all_tags:
+            auto_entity_tags = self._infer_entity_tags_from_content(content)
+            for t in auto_entity_tags:
+                if t not in all_tags:
+                    all_tags.append(t)
 
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
@@ -1717,12 +2479,19 @@ class HindsightMemoryProvider(MemoryProvider):
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
 
+        # ── 质量门禁：跳过低价值轮次 ──
+        if not self._check_retain_quality(user_content, assistant_content):
+            logger.debug("sync_turn: quality gate rejected, clearing %d buffered turns",
+                         len(self._session_turns))
+            self._session_turns.clear()
+            return
+
         def _do_retain() -> None:
             item = self._build_retain_kwargs(
                 content,
                 context=retain_context,
                 metadata=metadata_snapshot,
-                tags=lineage_tags or None,
+                tags=all_tags or None,
             )
             item.pop("bank_id", None)
             item.pop("retain_async", None)
@@ -1748,108 +2517,6 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._memory_mode == "context":
             return []
         return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
-
-    # ── Scene/entity tag inference ──────────────────────────────────
-
-    @staticmethod
-    def _match_scene_keyword(kw: str, text: str) -> bool:
-        """智能场景关键词匹配：中文用子串，英文短词/数字用精确边界，避免假阳性。
-
-        假阳性案例（修复前）：
-        - "pe" 匹配 "people"/"hope"/"type" → 错误触发 scene:stock
-        - "002" 匹配 "0.002" → 错误触发 scene:stock
-        - "api" 匹配 "capital"/"rapid" → 错误触发 scene:dev
-        - "git" 匹配 "digital"/"legit" → 错误触发 scene:dev
-        """
-        # 含中文 → 子串匹配（中文词足够特异）
-        if any('\u4e00' <= ch <= '\u9fff' for ch in kw):
-            return kw in text
-        # 纯数字 → 不允许前面有点号或数字（避免 "0.002"、"3000"），
-        # 后面无限制（允许 "002230" 中匹配 "002" 前缀）
-        if kw.isdigit():
-            return bool(re.search(r'(?<![.\d])' + re.escape(kw), text))
-        # 短英文（≤3字符，纯字母）→ ASCII-only 词边界
-        # 用 (?<![a-zA-Z]) 而非 \\b，因为 Python3 中 \\b 把 CJK 视为 \\w
-        if len(kw) <= 3 and kw.replace('.', '').isalpha():
-            return bool(re.search(r'(?<![a-zA-Z])' + re.escape(kw) + r'(?![a-zA-Z])', text))
-        # 其他（长词如 boll/adx/commit/config 等）→ 子串匹配（足够特异）
-        return kw in text
-
-    def _infer_scene(self, content: str) -> Optional[str]:
-        """根据内容推断场景标签"""
-        c = content.lower()
-        scene_patterns = [
-            ("scene:stock", ["股票", "股价", "持仓", "买入", "卖出", "止损", "加仓",
-                            "k线", "boll", "adx", "市盈率", "pe", "pb",
-                            "002", "300", "600", "688", "sz.", "sh."]),
-            ("scene:dev", ["代码", "bug", "pr", "merge", "commit", "重构",
-                          "部署", "config", "api", "函数", "模块", "git"]),
-            ("scene:trading", ["回测", "策略", "胜率", "盈亏比", "夏普",
-                              "walk-forward", "参数优化", "信号"]),
-            ("scene:project", ["项目", "进度", "里程碑", "需求", "架构"]),
-            ("scene:research", ["研究", "分析", "推理", "mcts", "深度", "产业链"]),
-        ]
-        for tag, keywords in scene_patterns:
-            if any(self._match_scene_keyword(kw, c) for kw in keywords):
-                return tag
-        return None
-
-    def _infer_entity_tags_from_content(self, content: str) -> List[str]:
-        """从内容中推断 AMAP 实体标签"""
-        tags = []
-        c = content
-        # 6位A股代码匹配（00/30/60/68开头 + 4位数字）
-        # 边界策略：
-        #   (?<![a-zA-Z0-9]) — 前面不能是字母或数字
-        #   (?<!\d\.)        — 前面不能是「数字.」(排除 "0.002230"，但保留 "sz.002230")
-        #   (?![a-zA-Z0-9])  — 后面不能是字母或数字
-        code_match = re.findall(
-            r'(?<![a-zA-Z0-9])(?<!\d\.)(?:00|30|60|68)\d{4}(?![a-zA-Z0-9])', c
-        )
-        for code in code_match:
-            tags.append(f"entity|object:stock_{code}")
-        tool_match = re.findall(r'tools/[\w_]+|scripts/[\w_]+|src/[\w./]+', c)
-        for t in tool_match:
-            clean = t.replace('/', '_').replace('.py', '')
-            tags.append(f"entity|resource:{clean}")
-        return list(set(tags))
-
-    def _parse_entity_tags(self, tags: List[str]) -> Dict[str, List[Dict]]:
-        """解析 entity| 和 relation| 标签为结构化数据"""
-        entities = []
-        relations = []
-        for tag in tags:
-            if tag.startswith("entity|"):
-                parts = tag.split(":", 1)
-                if len(parts) == 2:
-                    entities.append({"name": parts[1], "type": parts[0].replace("entity|", "")})
-            elif tag.startswith("relation|"):
-                parts = tag.split(":", 1)
-                if len(parts) == 2:
-                    relations.append({"target": parts[1]})
-        return {"entities": entities, "relations": relations}
-
-    def _tag_recall(self, tag: str, limit: int = 3, query: str = "") -> List:
-        """按标签召回最近的记忆"""
-        try:
-            import subprocess
-            payload = json.dumps({
-                "query": query or tag,
-                "tags": [tag],
-                "limit": limit,
-            })
-            r = subprocess.run(
-                ["curl", "-s", "-X", "POST",
-                 "http://127.0.0.1:9177/v1/default/banks/hermes/memories/recall",
-                 "-H", "Content-Type: application/json", "-d", payload],
-                capture_output=True, timeout=10,
-            )
-            if r.returncode == 0 and r.stdout:
-                data = json.loads(r.stdout)
-                return data if isinstance(data, list) else []
-        except Exception:
-            pass
-        return []
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
@@ -1925,206 +2592,60 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("hindsight_retain: entity dedup failed, proceeding: %s", e)
 
-            # ── raw 模式：摘要→hindsight，全文→wiki ──
-            if args.get("raw", False):
-                try:
-                    # 内联摘要提取
-                    import re as _re
-                    raw_text = content.strip()
-                    if len(raw_text) > 200:
-                        lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
-                        key_lines = []
-                        for line in lines:
-                            if _re.match(r'^[═\-—=#*▶▸→\s]+$', line):
-                                continue
-                            if any(kw in line for kw in ['结论','结果','确认','决定','方案',
-                                                          '修复','改为','设置','配置',
-                                                          '策略','规则','原则','偏好',
-                                                          '注意','风险','问题','原因']):
-                                key_lines.append(line)
-                            elif any(kw in line for kw in ['：',':']) and len(line) > 5:
-                                key_lines.append(line)
-                        if key_lines:
-                            summary = '；'.join(key_lines[:3])
-                            if len(summary) > 200:
-                                summary = summary[:197] + '...'
-                        else:
-                            for line in lines:
-                                if len(line) > 10 and not _re.match(r'^[═\-—=\s]+$', line):
-                                    summary = line[:197] + '...' if len(line) > 200 else line
-                                    break
-                            else:
-                                summary = raw_text[:197] + '...'
-                    else:
-                        summary = raw_text
-
-                    # 写全文到 wiki
-                    from datetime import date
-                    import os as _os, tempfile
-                    today = date.today().isoformat()
-                    vault = _os.environ.get('OBSIDIAN_VAULT_PATH', _os.path.expanduser('~/wiki'))
-                    dir_path = _os.path.join(vault, 'docs', 'agent-memory', 'raw', today)
-                    _os.makedirs(dir_path, exist_ok=True)
-
-                    import hashlib
-                    hkey = "raw_" + hashlib.md5(raw_text.encode()).hexdigest()[:12]
-                    file_path = _os.path.join(dir_path, f'{hkey}.md')
-
-                    wiki_content = f"""---
-type: memory_raw
-date: {today}
-hash: {hkey}
-tags: [{scene_tag or 'memory'}]
----
-
-{raw_text}
-"""
-                    fd, tmp = tempfile.mkstemp(dir=dir_path, suffix='.tmp', prefix='.mem_')
-                    try:
-                        with _os.fdopen(fd, 'w', encoding='utf-8') as f:
-                            f.write(wiki_content)
-                            f.flush()
-                            _os.fsync(f.fileno())
-                        _os.replace(tmp, file_path)
-                    except BaseException:
-                        try:
-                            _os.unlink(tmp)
-                        except _os.error:
-                            pass
-                        raise
-
-                    # 替换 content 为摘要+指针
-                    content = f"{summary}\n\n📄 obsidian:agent-memory/raw/{today}/{hkey}.md"
-                    if "obsidian" not in user_tags:
-                        user_tags.append("obsidian")
-                    logger.debug("hindsight_retain raw mode: stored full text to %s", file_path)
-                except Exception as e:
-                    logger.warning("hindsight_retain raw mode failed, falling back to normal: %s", e)
-
-            # 内容哈希去重（P1：相同内容跳过 API 调用）
-            import hashlib
-            content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
-            retain_doc_id = f"hindsight:{content_hash}"
-            skip_api = False
-            bm25 = _load_bm25()
-            if bm25 is not None:
-                try:
-                    if bm25.has_doc(retain_doc_id):
-                        skip_api = True
-                        logger.debug("hindsight_retain: content hash hit, skipping API call")
-                except Exception:
-                    pass
-
-            # 同步写入本地 BM25 索引（本地操作，微秒级）
-            if bm25 is not None:
-                try:
-                    bm25.add_doc(retain_doc_id, content, {"context": context, "tags": user_tags, "source": "hindsight_retain"})
-                    bm25.save_index()
-                except Exception as bm25_err:
-                    logger.debug("BM25 index sync failed (non-fatal): %s", bm25_err)
-
-            # 通过 writer 队列异步发送到 Hindsight API（P1：fire-and-forget）
-            if not skip_api:
+            try:
                 retain_kwargs = self._build_retain_kwargs(
                     content,
                     context=context,
-                    tags=user_tags,
+                    tags=user_tags or None,
                 )
-                logger.debug("Tool hindsight_retain: queueing, bank=%s, content_len=%d, context=%s",
-                             self._bank_id, len(content), context)
-
-                def _tool_retain_job():
-                    try:
-                        self._run_hindsight_operation(lambda client: client.aretain(**retain_kwargs))
-                        logger.debug("hindsight_retain (async): success")
-                    except Exception as e:
-                        logger.warning("hindsight_retain (async) failed: %s", e)
-
-                self._ensure_writer()
-                self._register_atexit()
-                self._retain_queue.put(_tool_retain_job)
-            else:
-                logger.debug("hindsight_retain: skipped API call (dedup hit)")
-
-            return json.dumps({"result": "Memory stored successfully."})
+                logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s, scene=%s",
+                             self._bank_id, len(content), context, scene_tag or "none")
+                self._run_hindsight_operation(lambda client: client.aretain(**retain_kwargs))
+                logger.debug("Tool hindsight_retain: success")
+                return json.dumps({"result": "Memory stored successfully."})
+            except Exception as e:
+                logger.warning("hindsight_retain failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to store memory: {e}")
 
         elif tool_name == "hindsight_recall":
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
+            mode = args.get("mode", "task")
+            hops = args.get("hops", 0)
             try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                # 优先使用调用时传入 tags，fallback 到 config 级别 _recall_tags
-                call_tags = args.get("tags")
-                if call_tags:
-                    recall_kwargs["tags"] = call_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                elif self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
-                logger.debug("Tool hindsight_recall: %d results", num_results)
-                # 同步查询本地 BM25 索引（P0：关键词搜索加速）
-                bm25_lines = []
-                bm25 = _load_bm25()
-                if bm25 is not None:
-                    try:
-                        # 构建 API 结果的内容哈希集合（用于 BM25 去重）
-                        import hashlib
-                        api_content_hashes = set()
-                        for r in (resp.results or []):
-                            if hasattr(r, 'text') and r.text:
-                                api_content_hashes.add(hashlib.md5(r.text.encode('utf-8')).hexdigest())
+                logger.debug("Tool hindsight_recall: query=%s, mode=%s, hops=%s",
+                             query[:80], mode, hops)
+                # Multi-hop graph expansion recall
+                results = self._recall_with_expand(
+                    query, mode=mode, hops=hops, max_results=20)
 
-                        bm25_results = bm25.search(query, limit=5)
-                        if bm25_results:
-                            has_output = False
-                            idx = 0
-                            for r in bm25_results:
-                                # 去重：跳过与 API 结果重复的 BM25 条目
-                                doc_id = r.get("id", "")
-                                if doc_id.startswith("hindsight:"):
-                                    content_hash = doc_id[len("hindsight:"):]
-                                    if content_hash in api_content_hashes:
-                                        logger.debug("BM25 dedup: skip %s (already in API results)", doc_id)
-                                        continue
-                                # 分数过滤：过低分数丢弃
-                                score = r.get("score", 0)
-                                if score < 0.5:
-                                    continue
-                                idx += 1
-                                if not has_output:
-                                    bm25_lines.append("")
-                                    bm25_lines.append("━ 本地 BM25 关键词检索 ━")
-                                    has_output = True
-                                preview = r.get("content_preview", "")
-                                if score > 5:
-                                    bm25_lines.append(f"BM25#{idx} (score={score:.2f}): {preview}")
-                                else:
-                                    bm25_lines.append(f"BM25#{idx}: {preview}")
-                    except Exception as bm25_err:
-                        logger.debug("BM25 recall failed (non-fatal): %s", bm25_err)
-                if not resp.results and not bm25_lines:
+                if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = []
-                for i, r in enumerate(resp.results, 1):
-                    r_tags = getattr(r, 'tags', None) or []
-                    scene_tags = [t for t in r_tags if isinstance(t, str) and t.startswith("scene:")]
-                    tag_str = f" [{','.join(scene_tags[:3])}]" if scene_tags else ""
-                    lines.append(f"{i}. {r.text}{tag_str}")
-                all_lines = lines + bm25_lines
-                return json.dumps({"result": "\n".join(all_lines)})
+
+                # 艾宾浩斯时间衰减重排序
+                scored = self._rerank_with_time_decay(results)
+                scored = self._dedup_results(scored)
+                lines = [f"{i}. {s[3]}" for i, s in enumerate(scored, 1)]
+                return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
-                logger.warning("hindsight_recall failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to search memory: {e}")
+                logger.warning("hindsight_recall expand failed: %s", e, exc_info=True)
+                # Fallback: single-point recall
+                try:
+                    recall_kwargs: dict = {
+                        "bank_id": self._bank_id, "query": query, "budget": self._budget,
+                        "max_tokens": self._recall_max_tokens,
+                    }
+                    resp = self._run_hindsight_operation(
+                        lambda client: client.arecall(**recall_kwargs))
+                    if not resp.results:
+                        return json.dumps({"result": "No relevant memories found."})
+                    scored = self._rerank_with_time_decay(resp.results)
+                    scored = self._dedup_results(scored)
+                    lines = [f"{i}. {s[3]}" for i, s in enumerate(scored, 1)]
+                    return json.dumps({"result": "\n".join(lines)})
+                except Exception as e2:
+                    return tool_error(f"Failed to search memory: {e2}")
 
         elif tool_name == "hindsight_reflect":
             query = args.get("query", "")
@@ -2259,7 +2780,6 @@ tags: [{scene_tag or 'memory'}]
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
-            self._prefetch_raw = ""
 
         # 3. Now rotate to the new session.
         if parent_session_id:
@@ -2274,6 +2794,195 @@ tags: [{scene_tag or 'memory'}]
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
             self._session_id, self._parent_session_id, reset, self._document_id,
         )
+
+    # ── TiMEM P2: Session summary + chain consolidation ─────────────────
+
+    # ── 提取会话关键事实的关键词模式 ──
+    _SUMMARY_ACTION_KEYWORDS = [
+        "修改", "新增", "删除", "配置", "设置", "改成了", "改为",
+        "修复", "解决", "实现了", "添加", "升级", "迁移", "部署",
+        "决定", "选择了", "方案", "放弃了", "同意",
+        "发现", "根因", "原因", "问题", "障碍",
+    ]
+    _SUMMARY_SKIP_PREFIXES = [
+        "User:", "Assistant:", "用户:", "助手:",
+    ]
+
+    def _extract_key_facts(self, text: str) -> list[str]:
+        """从助手回答中提取含关键动作的事实句。"""
+        text = text.strip()
+        # 跳过角色前缀
+        for p in self._SUMMARY_SKIP_PREFIXES:
+            if text.startswith(p):
+                text = text[len(p):].strip()
+
+        facts = []
+        # 按句号/换行分割
+        for line in text.replace("\\n", "\n").split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # 检查是否含动作关键词
+            if any(kw in line for kw in self._SUMMARY_ACTION_KEYWORDS):
+                # 截取到160字符，保持完整句
+                if len(line) > 160:
+                    line = line[:157] + "..."
+                facts.append(line)
+        return facts
+
+    def _build_session_summary(self) -> str:
+        """提取会话中的关键事实、决策和变更，输出结构化摘要。
+
+        区别于旧版（拼接原文），新版只保留含动作关键词的句子，
+        压缩成 3-8 行关键事实，更适合 hindsight 召回。
+        """
+        if not self._session_turns:
+            return ""
+
+        all_facts: list[str] = []
+        seen: set[str] = set()
+        total_user = 0
+        total_assistant = 0
+
+        for t in self._session_turns:
+            try:
+                parsed = json.loads(t)
+                msgs = parsed if isinstance(parsed, list) else [parsed]
+                for msg in msgs:
+                    raw = msg.get("content") or ""
+                    role = msg.get("role", "")
+                    if role == "user":
+                        total_user += 1
+                    elif role == "assistant":
+                        total_assistant += 1
+                        facts = self._extract_key_facts(raw)
+                        for f in facts:
+                            norm = re.sub(r"\s+", " ", f).strip().lower()[:60]
+                            if norm not in seen:
+                                seen.add(norm)
+                                all_facts.append(f)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if not all_facts and not total_user:
+            return ""
+
+        # 标题
+        sid = self._session_id[:12] if self._session_id else "unknown"
+        lines: list[str] = [
+            f"【会话摘要·{sid}】",
+            f"共 {total_user} 轮用户对话，{total_assistant} 轮助手回复",
+        ]
+
+        # 场景标签推断（用来生成场景前缀）
+        all_text = json.dumps(self._session_turns) if self._session_turns else ""
+        scene = self._infer_scene(all_text)
+        if scene:
+            lines[0] = f"【{scene}·{sid}】"
+
+        # 关键事实（不超过8条）
+        for f in all_facts[:8]:
+            lines.append(f"- {f}")
+
+        n_more = len(all_facts) - 8
+        if n_more > 0:
+            lines.append(f"  ... 还有 {n_more} 条变更")
+
+        # 无关键事实时的兜底
+        if not all_facts:
+            lines.append("- 本会话主要讨论和调试，无明显关键变更")
+
+        return "\n".join(lines)
+
+    def on_session_end(self, messages: list[dict]) -> None:
+        """Generate session summary and trigger chain consolidation (P2).
+
+        Called when a session ends (CLI exit, /reset, gateway expiry).
+        Stores a session-summary, then chains to daily-summary.
+        """
+        try:
+            summary = self._build_session_summary()
+            if not summary:
+                return
+
+            scene_tag = self._infer_scene(summary)
+            lineage_tags = [f"session:{self._session_id}"] if self._session_id else []
+            all_tags = ["session-summary"] + lineage_tags
+            if scene_tag and scene_tag not in all_tags:
+                all_tags.append(scene_tag)
+            # P3.2: Auto-infer AMAP entity tags from session summary
+            auto_entity_tags = self._infer_entity_tags_from_content(summary)
+            for t in auto_entity_tags:
+                if t not in all_tags:
+                    all_tags.append(t)
+            retain_kwargs = self._build_retain_kwargs(
+                summary,
+                context="auto-session-summary",
+                tags=all_tags,
+            )
+            retain_kwargs.pop("bank_id", None)
+            retain_kwargs.pop("retain_async", None)
+            self._run_hindsight_operation(
+                lambda client: client.aretain_batch(
+                    bank_id=self._bank_id,
+                    items=[retain_kwargs],
+                    document_id=self._document_id,
+                    retain_async=self._retain_async,
+                )
+            )
+            logger.debug("on_session_end: session-summary stored")
+        except Exception as e:
+            logger.debug("on_session_end (session-summary) failed: %s", e)
+
+        # Chain: search today's session-summaries → daily-summary
+        try:
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if not self._run_hindsight_operation:
+                return
+            # Recall today's session-summaries
+            recall_kwargs = {
+                "bank_id": self._bank_id,
+                "query": date_str,
+                "budget": "low",
+                "max_tokens": 2048,
+                "tags": ["session-summary"],
+                "tags_match": "any",
+            }
+            resp = self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs)
+            )
+            if not resp or not resp.results or len(resp.results) < 2:
+                logger.debug("chain: not enough session-summaries yet (<2)")
+                return
+
+            lines = [f"- {r.text[:200]}" for r in resp.results[:15]]
+            daily = (
+                f"【日汇总·{date_str}】"
+                f"共{len(resp.results)}条会话摘要\n"
+                + "\n".join(lines)
+            )
+            scene_tag_daily = self._infer_scene(daily)
+            daily_tags = ["daily-summary", f"date:{date_str}"]
+            if scene_tag_daily and scene_tag_daily not in daily_tags:
+                daily_tags.append(scene_tag_daily)
+            daily_kwargs = self._build_retain_kwargs(
+                daily,
+                context="auto-daily-summary",
+                tags=daily_tags,
+            )
+            daily_kwargs.pop("bank_id", None)
+            daily_kwargs.pop("retain_async", None)
+            self._run_hindsight_operation(
+                lambda client: client.aretain_batch(
+                    bank_id=self._bank_id,
+                    items=[daily_kwargs],
+                    document_id=self._document_id,
+                    retain_async=self._retain_async,
+                )
+            )
+            logger.debug("chain: daily-summary stored for %s", date_str)
+        except Exception as e:
+            logger.debug("chain consolidation failed: %s", e)
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
