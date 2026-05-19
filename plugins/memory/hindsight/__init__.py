@@ -1271,21 +1271,27 @@ class HindsightMemoryProvider(MemoryProvider):
             return (
                 f"# Hindsight Memory\n"
                 f"Active (context mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
-                f"Relevant memories are automatically injected into context."
+                f"Relevant memories are automatically injected into context.\n"
+                f"【知识提示】wiki/docs/topics/ 下有历史分析结论和读书笔记，"
+                f"涉及技术/宏观/个股等问题时，先用知识路由(knowledge_router)查证再回答。"
             )
         if self._memory_mode == "tools":
             return (
                 f"# Hindsight Memory\n"
                 f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
                 f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-                f"hindsight_retain to store facts."
+                f"hindsight_retain to store facts.\n"
+                f"【知识提示】wiki/docs/topics/ 下有历史分析结论和读书笔记，"
+                f"涉及技术/宏观/个股等问题时，先用知识路由(knowledge_router)查证再回答。"
             )
         return (
             f"# Hindsight Memory\n"
             f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
             f"Relevant memories are automatically injected into context. "
             f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-            f"hindsight_retain to store facts."
+            f"hindsight_retain to store facts.\n"
+            f"【知识提示】wiki/docs/topics/ 下有历史分析结论和读书笔记，"
+            f"涉及技术/宏观/个股等问题时，先用知识路由(knowledge_router)查证再回答。"
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -1504,6 +1510,21 @@ class HindsightMemoryProvider(MemoryProvider):
                                                  len(extra_lines))
                     except Exception as ppr_e:
                         logger.debug("Prefetch PPR expand failed: %s", ppr_e, exc_info=True)
+
+                # ── 宏观层：读取近期滚动总结 ──
+                macro_path = os.path.expanduser("~/wiki/docs/agent-memory/recent_macro.md")
+                try:
+                    if os.path.exists(macro_path):
+                        with open(macro_path) as f:
+                            macro_content = f.read().strip()
+                        if macro_content:
+                            if text:
+                                text = macro_content + "\n\n# 近期记忆详情\n" + text
+                            else:
+                                text = macro_content
+                            logger.debug("Prefetch: added macro layer (%d chars)", len(macro_content))
+                except Exception as macro_e:
+                    logger.debug("Prefetch macro layer failed: %s", macro_e)
 
                 if text:
                     with self._prefetch_lock:
