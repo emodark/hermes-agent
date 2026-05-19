@@ -701,6 +701,38 @@ MEMORY_SCHEMA = {
 }
 
 
+def _infer_scene_tag(content: str) -> Optional[str]:
+    """从文本推断场景标签"""
+    c = content.lower()
+    patterns = [
+        ("scene:stock", ["股票", "股价", "持仓", "买入", "卖出", "止损", "加仓",
+                        "k线", "boll", "adx", "市盈率", "pe", "pb",
+                        "002", "300", "600", "688", "sz.", "sh."]),
+        ("scene:dev", ["代码", "bug", "pr", "merge", "commit", "重构",
+                      "部署", "config", "api", "函数", "模块", "git"]),
+        ("scene:trading", ["回测", "策略", "胜率", "盈亏比", "夏普",
+                          "walk-forward", "参数优化", "信号"]),
+        ("scene:project", ["项目", "进度", "里程碑", "需求", "架构"]),
+        ("scene:research", ["研究", "分析", "推理", "mcts", "深度", "产业链"]),
+    ]
+    for tag, keywords in patterns:
+        if any(kw in c for kw in keywords):
+            return tag
+    return None
+
+
+def _infer_entity_tags(content: str) -> List[str]:
+    """从文本推断实体标签"""
+    tags = []
+    codes = re.findall(r'\b(?:00|30|60|68)\d{3}\b', content)
+    for code in codes:
+        tags.append(f"entity|object:stock_{code}")
+    tools = re.findall(r'tools/[\w_]+|scripts/[\w_]+|src/[\w./]+', content)
+    for t in tools:
+        tags.append(f"entity|resource:{t.replace('/', '_').replace('.py', '')}")
+    return list(set(tags))
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 

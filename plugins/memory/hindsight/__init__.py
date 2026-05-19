@@ -35,10 +35,11 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
@@ -1514,6 +1515,77 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._memory_mode == "context":
             return []
         return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+
+    # ── Scene/entity tag inference ──────────────────────────────────
+
+    def _infer_scene(self, content: str) -> Optional[str]:
+        """根据内容推断场景标签"""
+        c = content.lower()
+        scene_patterns = [
+            ("scene:stock", ["股票", "股价", "持仓", "买入", "卖出", "止损", "加仓",
+                            "k线", "boll", "adx", "市盈率", "pe", "pb",
+                            "002", "300", "600", "688", "sz.", "sh."]),
+            ("scene:dev", ["代码", "bug", "pr", "merge", "commit", "重构",
+                          "部署", "config", "api", "函数", "模块", "git"]),
+            ("scene:trading", ["回测", "策略", "胜率", "盈亏比", "夏普",
+                              "walk-forward", "参数优化", "信号"]),
+            ("scene:project", ["项目", "进度", "里程碑", "需求", "架构"]),
+            ("scene:research", ["研究", "分析", "推理", "mcts", "深度", "产业链"]),
+        ]
+        for tag, keywords in scene_patterns:
+            if any(kw in c for kw in keywords):
+                return tag
+        return None
+
+    def _infer_entity_tags_from_content(self, content: str) -> List[str]:
+        """从内容中推断 AMAP 实体标签"""
+        tags = []
+        c = content
+        code_match = re.findall(r'\b(?:00|30|60|68)\d{3}\b', c)
+        for code in code_match:
+            tags.append(f"entity|object:stock_{code}")
+        tool_match = re.findall(r'tools/[\w_]+|scripts/[\w_]+|src/[\w./]+', c)
+        for t in tool_match:
+            clean = t.replace('/', '_').replace('.py', '')
+            tags.append(f"entity|resource:{clean}")
+        return list(set(tags))
+
+    def _parse_entity_tags(self, tags: List[str]) -> Dict[str, List[Dict]]:
+        """解析 entity| 和 relation| 标签为结构化数据"""
+        entities = []
+        relations = []
+        for tag in tags:
+            if tag.startswith("entity|"):
+                parts = tag.split(":", 1)
+                if len(parts) == 2:
+                    entities.append({"name": parts[1], "type": parts[0].replace("entity|", "")})
+            elif tag.startswith("relation|"):
+                parts = tag.split(":", 1)
+                if len(parts) == 2:
+                    relations.append({"target": parts[1]})
+        return {"entities": entities, "relations": relations}
+
+    def _tag_recall(self, tag: str, limit: int = 3, query: str = "") -> List:
+        """按标签召回最近的记忆"""
+        try:
+            import subprocess
+            payload = json.dumps({
+                "query": query or tag,
+                "tags": [tag],
+                "limit": limit,
+            })
+            r = subprocess.run(
+                ["curl", "-s", "-X", "POST",
+                 "http://127.0.0.1:9177/v1/default/banks/hermes/memories/recall",
+                 "-H", "Content-Type: application/json", "-d", payload],
+                capture_output=True, timeout=10,
+            )
+            if r.returncode == 0 and r.stdout:
+                data = json.loads(r.stdout)
+                return data if isinstance(data, list) else []
+        except Exception:
+            pass
+        return []
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
