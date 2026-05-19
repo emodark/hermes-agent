@@ -1443,12 +1443,13 @@ class HindsightMemoryProvider(MemoryProvider):
                     except Exception:
                         pass
 
-                    # 格式化上下文时带上标签信息，帮助区分相似内容
+                    # 格式化上下文只带 scene 标签，区分场景噪声最小
                     lines = []
                     for s in scored:
                         content = s[3] if len(s) > 3 else ""
                         tags = s[4] if len(s) > 4 and s[4] else []
-                        tag_str = f" [{','.join(tags[:6])}]" if tags else ""
+                        scene_tags = [t for t in tags if t.startswith("scene:")]
+                        tag_str = f" [{','.join(scene_tags[:3])}]" if scene_tags else ""
                         lines.append(f"- {content}{tag_str}")
                     text = "\n".join(lines) if lines else ""
 
@@ -1932,7 +1933,8 @@ tags: [{scene_tag or 'memory'}]
                 lines = []
                 for i, r in enumerate(resp.results, 1):
                     r_tags = getattr(r, 'tags', None) or []
-                    tag_str = f" [{','.join(r_tags[:6])}]" if r_tags else ""
+                    scene_tags = [t for t in r_tags if isinstance(t, str) and t.startswith("scene:")]
+                    tag_str = f" [{','.join(scene_tags[:3])}]" if scene_tags else ""
                     lines.append(f"{i}. {r.text}{tag_str}")
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
