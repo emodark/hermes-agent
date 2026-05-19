@@ -255,6 +255,10 @@ RETAIN_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Optional per-call tags to merge with configured default retain tags.",
             },
+            "raw": {
+                "type": "boolean",
+                "description": "If true, also write full text to Obsidian vault and store summary+pointer in hindsight.",
+            },
         },
         "required": ["content"],
     },
@@ -270,6 +274,10 @@ RECALL_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
+            "tags": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Filter results to memories matching these tags (e.g. [\"scene:stock\"]). Uses recall_tags_match mode from config.",
+            },
         },
         "required": ["query"],
     },
@@ -580,15 +588,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall controls
         self._auto_recall = True
         self._recall_max_tokens = 4096
-        # Default to observation-only recall. Observations are Hindsight's
-        # consolidated knowledge layer — deduplicated, evidence-grounded
-        # beliefs built from many raw facts, with proof counts and
-        # freshness signals (see hindsight.vectorize.io/developer/observations).
-        # Including raw world/experience facts re-ships the supporting
-        # evidence that observations already summarize, burning the
-        # `recall_max_tokens` budget. Users can restore the broader
-        # recall via the `recall_types` config key.
-        self._recall_types: list[str] = ["observation"]
+        self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
@@ -639,13 +639,13 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
         """Custom setup wizard — installs only the deps needed for the selected mode."""
+        import getpass
         import subprocess
         import shutil
         import sys
         from pathlib import Path
 
         from hermes_cli.config import save_config
-        from hermes_cli.secret_prompt import masked_secret_prompt
 
         from hermes_cli.memory_setup import _curses_select
 
@@ -706,11 +706,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 masked = f"...{existing_key[-4:]}" if len(existing_key) > 4 else "set"
                 sys.stdout.write(f"  API key (current: {masked}, blank to keep): ")
                 sys.stdout.flush()
-                api_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                api_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             else:
                 sys.stdout.write("  API key: ")
                 sys.stdout.flush()
-                api_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                api_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             if api_key:
                 env_writes["HINDSIGHT_API_KEY"] = api_key
 
@@ -724,7 +724,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
             sys.stdout.write("  API key (optional, blank to skip): ")
             sys.stdout.flush()
-            api_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+            api_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             if api_key:
                 env_writes["HINDSIGHT_API_KEY"] = api_key
 
@@ -760,7 +760,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
             sys.stdout.write("  LLM API key: ")
             sys.stdout.flush()
-            llm_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+            llm_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             if llm_key:
                 env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
             else:
@@ -866,7 +866,6 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
-            {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
@@ -1198,17 +1197,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
-        # Default narrows recall to observation-only; pass an explicit
-        # `recall_types` list in config.json to broaden (e.g. include
-        # "world" / "experience") or to disable the filter entirely.
-        configured_types = self._config.get("recall_types")
-        if configured_types is None:
-            self._recall_types = ["observation"]
-        elif isinstance(configured_types, str):
-            # Allow comma-separated strings for parity with recall_tags.
-            self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
-        else:
-            self._recall_types = list(configured_types) or ["observation"]
+        self._recall_types = self._config.get("recall_types") or None
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
@@ -1352,7 +1341,169 @@ class HindsightMemoryProvider(MemoryProvider):
                     resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                     num_results = len(resp.results) if resp.results else 0
                     logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                    # 艾宾浩斯时间衰减重排序
+                    scored = self._rerank_with_time_decay(resp.results or [])
+                    # 去重：daily-summary 重复记忆，保留分数最高版本
+                    scored = self._dedup_results(scored)
+                    # 场景隔离重排序：检测查询场景，同场景结果优先
+                    scored = self._scene_filter_results(scored, query)
+                    # ── P0/P1/P2/P3 分级过滤 ──
+                    # P0: entity|object 标签 → 全量保留（高价值，通常带 AMAP 实体映射）
+                    # P1: 纯 auto_retain（无 entity|object）→ 最多 3 条（备查即可）
+                    # P2: 其它（非 skill 非 auto）→ 正常保留
+                    # P3: skill 日常更新类 → 压缩为摘要，保留实体+动作+时间
+                    try:
+                        import re
+                        p0, p1_auto, p2_other, p3 = [], [], [], []
+                        for s in scored:
+                            content = s[3] if len(s) > 3 else ""
+                            tags = s[4] if len(s) > 4 else []
+                            has_entity_obj = any(str(t).startswith("entity|object:") for t in tags)
+                            has_auto_retain = any("entity|concept:auto_retain" in str(t) for t in tags)
+                            is_skill = any(kw in content.lower() for kw in
+                                           ["skill update", "skill library", "skills 更新"])
+                            if has_entity_obj:
+                                p0.append(s)      # P0: 高价值
+                            elif has_auto_retain and not has_entity_obj:
+                                p1_auto.append(s)  # P1: 纯 auto_retain，限流
+                            elif is_skill:
+                                p3.append(s)       # P3: skill 更新
+                            else:
+                                p2_other.append(s) # P2: 其他有价值内容
+                        # P1: auto_retain 最多保留 3 条
+                        auto_cap = min(len(p1_auto), 3)
+                        if len(p1_auto) > 3:
+                            logger.debug("Prefetch P1(auto_retain): capped %d→3", len(p1_auto))
+                        p1_capped = p1_auto[:3]
+                        # 压缩 P3：提取核心事实，不丢 who/when
+                        if p3:
+                            old_count = len(p3)
+                            seen_fingerprint = set()
+                            p3_compressed = []
+                            for s in p3:
+                                content = s[3]
+                                # 提取核心事实：取 "| When:" 之前的部分作为key
+                                # 格式: "<实体> <动作> <详情> | When: <日期> | Involving: <谁>"
+                                core_part = content.split("| When:")[0].split("| 时间:")[0].strip()
+                                # 规范化fingerprint用于去重
+                                fp = re.sub(r'\s+', ' ', core_part.lower())[:50]
+                                if fp not in seen_fingerprint:
+                                    seen_fingerprint.add(fp)
+                                    # 核心事实完整保留，不需要截断
+                                    p3_compressed.append(
+                                        (s[0], s[1] * 0.6, s[2], core_part,
+                                         s[4] if len(s) > 4 else [])
+                                    )
+                            logger.debug("Prefetch P0/P1/P2/P3: P0=%d P1=%d→%d P2=%d P3=%d→%d",
+                                         len(p0), len(p1_auto), len(p1_capped),
+                                         len(p2_other), old_count, len(p3_compressed))
+                            scored = p0 + p1_capped + p2_other + p3_compressed
+                        else:
+                            logger.debug("Prefetch P0/P1/P2/P3: P0=%d P1=%d→%d P2=%d P3=0",
+                                         len(p0), len(p1_auto), len(p1_capped), len(p2_other))
+                    except Exception as e:
+                        logger.debug("Prefetch P0/P1/P2/P3 grading failed, using raw results: %s", e)
+
+                    # ── 跨语言实体去重 ──
+                    # 中英文描述同一事实时保留分数更高的版本
+                    # 指纹提取：取英文技术标识符(含下划线/大写/数字) + 中文短语辅助
+                    try:
+                        import re as _re
+                        _ENG_STOP = {'the','was','were','this','that','with','from',
+                            'been','have','will','would','could','should','their',
+                            'there','which','also','after','into','than','over',
+                            'about','said','each','when','what','more','some',
+                            'them','then','very','just','because','before','have'}
+                        deduped_final = []
+                        seen_entity = set()
+                        for s in scored:
+                            content = s[3]
+                            core = _re.sub(r'(?i)\|\s*(when|involving|时间)\s*[:：].*', '', content)
+                            # 只保留含特殊字符/大写/数字的英文词（技术标识符特征）
+                            eng_terms = _re.findall(r'[a-zA-Z_][a-zA-Z0-9_-]{3,}', core)
+                            tech_terms = sorted(set(
+                                t.lower() for t in eng_terms
+                                if _re.search(r'[_-]|[A-Z]|\d', t)
+                                and t.lower() not in _ENG_STOP
+                            ))[:3]
+                            cn_phrases = _re.findall(r'[\u4e00-\u9fff]{2,}', core)
+                            if tech_terms:
+                                entity_fp = "::".join(tech_terms)
+                            elif cn_phrases:
+                                entity_fp = cn_phrases[0][:8]
+                            else:
+                                entity_fp = core[:30].lower().strip()
+                            if entity_fp not in seen_entity:
+                                seen_entity.add(entity_fp)
+                                deduped_final.append(s)
+                        removed_x = len(scored) - len(deduped_final)
+                        if removed_x > 0:
+                            logger.debug("Prefetch cross-lang dedup: %d→%d", len(scored), len(deduped_final))
+                        scored = deduped_final
+                    except Exception:
+                        pass
+
+                    # 格式化上下文时带上标签信息，帮助区分相似内容
+                    lines = []
+                    for s in scored:
+                        content = s[3] if len(s) > 3 else ""
+                        tags = s[4] if len(s) > 4 and s[4] else []
+                        tag_str = f" [{','.join(tags[:6])}]" if tags else ""
+                        lines.append(f"- {content}{tag_str}")
+                    text = "\n".join(lines) if lines else ""
+
+                # ── PPR 图扩散扩展 ──
+                if self._prefetch_method != "reflect":
+                    try:
+                        # 每10次 prefetch 刷新一次动态路由
+                        self._AMAP_DYNAMIC_PREFETCH_COUNT += 1
+                        if self._AMAP_DYNAMIC_PREFETCH_COUNT % 10 == 0:
+                            self._update_amap_routes()
+
+                        # Build seed nodes from AMAP + recall results
+                        seed_nodes = []
+                        amap_entity = self._try_amap_match(query)
+                        if amap_entity:
+                            seed_nodes.append(amap_entity)
+
+                        # 从语义召回结果中提取 entity 标签作为种子
+                        if resp and resp.results:
+                            for r in resp.results[:5]:
+                                for tag in (getattr(r, 'tags', None) or []):
+                                    ts = str(tag)
+                                    if ts.startswith("entity|"):
+                                        if ts not in seed_nodes:
+                                            seed_nodes.append(ts)
+
+                        if seed_nodes:
+                            # 构建/刷新图
+                            n_nodes = self._memory_graph.build_from_hindsight()
+                            logger.debug("Prefetch PPR: graph has %d nodes, seeds=%s",
+                                         n_nodes, seed_nodes[:3])
+
+                            # PPR 扩散
+                            expanded = self._memory_graph.get_expanded_nodes(
+                                seed_nodes, top_k=5, min_score=0.005)
+
+                            if expanded:
+                                extra_lines = []
+                                for node, score in expanded:
+                                    tag_results = self._tag_recall(node, limit=2)
+                                    for r in tag_results:
+                                        if r.text:
+                                            extra_lines.append(
+                                                f"- [关联:{score:.2f}] {r.text}")
+                                if extra_lines:
+                                    extra_text = "\n".join(extra_lines[:8])
+                                    if text:
+                                        text = text + "\n# 联想记忆扩展\n" + extra_text
+                                    else:
+                                        text = "# 联想记忆扩展\n" + extra_text
+                                    logger.debug("Prefetch PPR: added %d expanded memories",
+                                                 len(extra_lines))
+                    except Exception as ppr_e:
+                        logger.debug("Prefetch PPR expand failed: %s", ppr_e, exc_info=True)
+
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
@@ -1593,11 +1744,155 @@ class HindsightMemoryProvider(MemoryProvider):
             if not content:
                 return tool_error("Missing required parameter: content")
             context = args.get("context")
+            # TiMEM P1: auto-infer scene and inject as tag (not content prefix)
+            scene_tag = self._infer_scene(content)
+            user_tags = list(args.get("tags") or [])
+            if scene_tag and scene_tag not in user_tags:
+                user_tags.append(scene_tag)
+
+            # P3.1: Auto-infer AMAP entity tags from content
+            if not"--no-auto-entity" in (args.get("tags") or []):
+                auto_entity_tags = self._infer_entity_tags_from_content(content)
+                for t in auto_entity_tags:
+                    if t not in user_tags:
+                        user_tags.append(t)
+
+            # Parse entity/relation tags for associative memory
+            parsed = self._parse_entity_tags(user_tags)
+            if parsed["entities"] or parsed["relations"]:
+                logger.debug(
+                    "Entity-aware retain: entities=%s, relations=%s",
+                    [e["name"] for e in parsed["entities"]],
+                    [r["target"] for r in parsed["relations"]],
+                )
+
+            # ── 语义去重：retain 前检查是否已有近重复内容 ──
+            dedup_enabled = self._config.get("dedup", True)
+            if dedup_enabled and content.strip():
+                try:
+                    import subprocess
+                    dedup_script = os.path.join(get_hermes_home(), "hindsight", "memory_dedup.py")
+                    r = subprocess.run(
+                        ["python3", dedup_script, "filter"],
+                        input=content.encode("utf-8"),
+                        capture_output=True, timeout=10,
+                    )
+                    stdout = r.stdout.decode("utf-8", errors="replace").strip()
+                    # returncode: 0=唯一  1=严格重复(≥0.85)  2=近似(≥0.70)
+                    if r.returncode in (1, 2):
+                        label = "duplicate" if r.returncode == 1 else "approximate"
+                        score_str = stdout.split("|")[1] if "|" in stdout else "?"
+                        logger.debug("hindsight_retain: skipped (%s, score=%s)", label, score_str)
+                        return json.dumps({"result": f"Memory already exists ({label}, deduplicated)."})
+                except Exception as e:
+                    logger.debug("hindsight_retain: dedup check failed, proceeding: %s", e)
+
+            # ── Entity-based dedup: if same entity tags exist within 24h, skip ──
+            try:
+                from datetime import datetime, timezone, timedelta
+                entity_dedup_hours = int(self._config.get("entity_dedup_window_hours", 24))
+                if auto_entity_tags and entity_dedup_hours > 0:
+                    for entity_tag in auto_entity_tags:
+                        recent_entity = self._tag_recall(entity_tag, limit=3, query="")
+                        now_utc = datetime.now(timezone.utc)
+                        has_recent = False
+                        for r in recent_entity:
+                            created_str = getattr(r, "mentioned_at", None) or getattr(r, "created_at", None) or ""
+                            if created_str:
+                                try:
+                                    created = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                                    if (now_utc - created) < timedelta(hours=entity_dedup_hours):
+                                        has_recent = True
+                                        break
+                                except (ValueError, TypeError):
+                                    continue
+                        if has_recent:
+                            logger.debug("hindsight_retain: entity dedup hit for %s, skipping", entity_tag)
+                            return json.dumps({"result": f"Memory already exists (entity dedup: {entity_tag})."})
+            except Exception as e:
+                logger.debug("hindsight_retain: entity dedup failed, proceeding: %s", e)
+
+            # ── raw 模式：摘要→hindsight，全文→wiki ──
+            if args.get("raw", False):
+                try:
+                    # 内联摘要提取
+                    import re as _re
+                    raw_text = content.strip()
+                    if len(raw_text) > 200:
+                        lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
+                        key_lines = []
+                        for line in lines:
+                            if _re.match(r'^[═\-—=#*▶▸→\s]+$', line):
+                                continue
+                            if any(kw in line for kw in ['结论','结果','确认','决定','方案',
+                                                          '修复','改为','设置','配置',
+                                                          '策略','规则','原则','偏好',
+                                                          '注意','风险','问题','原因']):
+                                key_lines.append(line)
+                            elif any(kw in line for kw in ['：',':']) and len(line) > 5:
+                                key_lines.append(line)
+                        if key_lines:
+                            summary = '；'.join(key_lines[:3])
+                            if len(summary) > 200:
+                                summary = summary[:197] + '...'
+                        else:
+                            for line in lines:
+                                if len(line) > 10 and not _re.match(r'^[═\-—=\s]+$', line):
+                                    summary = line[:197] + '...' if len(line) > 200 else line
+                                    break
+                            else:
+                                summary = raw_text[:197] + '...'
+                    else:
+                        summary = raw_text
+
+                    # 写全文到 wiki
+                    from datetime import date
+                    import os as _os, tempfile
+                    today = date.today().isoformat()
+                    vault = _os.environ.get('OBSIDIAN_VAULT_PATH', _os.path.expanduser('~/wiki'))
+                    dir_path = _os.path.join(vault, 'agent-memory', 'raw', today)
+                    _os.makedirs(dir_path, exist_ok=True)
+
+                    import hashlib
+                    hkey = "raw_" + hashlib.md5(raw_text.encode()).hexdigest()[:12]
+                    file_path = _os.path.join(dir_path, f'{hkey}.md')
+
+                    wiki_content = f"""---
+type: memory_raw
+date: {today}
+hash: {hkey}
+tags: [{scene_tag or 'memory'}]
+---
+
+{raw_text}
+"""
+                    fd, tmp = tempfile.mkstemp(dir=dir_path, suffix='.tmp', prefix='.mem_')
+                    try:
+                        with _os.fdopen(fd, 'w', encoding='utf-8') as f:
+                            f.write(wiki_content)
+                            f.flush()
+                            _os.fsync(f.fileno())
+                        _os.replace(tmp, file_path)
+                    except BaseException:
+                        try:
+                            _os.unlink(tmp)
+                        except _os.error:
+                            pass
+                        raise
+
+                    # 替换 content 为摘要+指针
+                    content = f"{summary}\n\n📄 obsidian:agent-memory/raw/{today}/{hkey}.md"
+                    if "obsidian" not in user_tags:
+                        user_tags.append("obsidian")
+                    logger.debug("hindsight_retain raw mode: stored full text to %s", file_path)
+                except Exception as e:
+                    logger.warning("hindsight_retain raw mode failed, falling back to normal: %s", e)
+
             try:
                 retain_kwargs = self._build_retain_kwargs(
                     content,
                     context=context,
-                    tags=args.get("tags"),
+                    tags=user_tags,
                 )
                 logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                              self._bank_id, len(content), context)
@@ -1617,7 +1912,12 @@ class HindsightMemoryProvider(MemoryProvider):
                     "bank_id": self._bank_id, "query": query, "budget": self._budget,
                     "max_tokens": self._recall_max_tokens,
                 }
-                if self._recall_tags:
+                # 优先使用调用时传入 tags，fallback 到 config 级别 _recall_tags
+                call_tags = args.get("tags")
+                if call_tags:
+                    recall_kwargs["tags"] = call_tags
+                    recall_kwargs["tags_match"] = self._recall_tags_match
+                elif self._recall_tags:
                     recall_kwargs["tags"] = self._recall_tags
                     recall_kwargs["tags_match"] = self._recall_tags_match
                 if self._recall_types:
@@ -1629,7 +1929,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = []
+                for i, r in enumerate(resp.results, 1):
+                    r_tags = getattr(r, 'tags', None) or []
+                    tag_str = f" [{','.join(r_tags[:6])}]" if r_tags else ""
+                    lines.append(f"{i}. {r.text}{tag_str}")
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
