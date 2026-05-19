@@ -28,6 +28,7 @@ import logging
 import os
 import tempfile
 import time
+from datetime import datetime
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -617,10 +618,179 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    # ── Auto-convert: full text → pointer format ────────────────────────
+    # [CORE] 规则 → 直接写 MEMORY.md，不走 hindsight
+    # 其他内容 → 存 hindsight + 写指针到 recent_macro.md，跳过 MEMORY.md
+    if target == "memory" and action in ("add", "replace") and content:
+        content_stripped = content.strip()
+        is_core_rule = content_stripped.startswith("[CORE]")
+
+        if is_core_rule:
+            # [CORE] 规则直接写 MEMORY.md，不存 hindsight，不建指针
+            log.info("Memory: [CORE] rule saved directly to MEMORY.md")
+        else:
+            has_tier = content_stripped.startswith(("[LTM]", "[STM]", "[WM]", "[ELIM]"))
+            has_pointer = "→ h:" in content_stripped
+            has_auto_pointer = "→ h:auto" in content_stripped
+            if not (has_tier and has_pointer) or has_auto_pointer:
+                # Auto-store to hindsight, convert content to pointer format
+                import hashlib, logging as log_mod, subprocess
+                log = log_mod.getLogger(__name__)
+                hindsight_key = "auto_" + hashlib.md5(content.encode()).hexdigest()[:12]
+                brief = _extract_brief(content_stripped)
+                # Strip existing tier tag if present (auto-convert normalizes to [STM])
+                if has_tier:
+                    for tag in ("[LTM]", "[STM]", "[WM]", "[ELIM]"):
+                        if brief.startswith(tag):
+                            brief = brief[len(tag):].lstrip()
+                            break
+                # Preserve original tier, default to STM for new entries
+                original_tier = None
+                if has_tier:
+                    for tag in ("[LTM]", "[STM]", "[WM]", "[ELIM]"):
+                        if content_stripped.startswith(tag):
+                            original_tier = tag
+                            break
+                        if content_stripped.startswith("[" + tag):  # [[LTM]]
+                            original_tier = tag
+                            break
+                auto_tier = original_tier if original_tier else "STM"
+                pointer_entry = f"[{auto_tier}] {brief} | → h:{hindsight_key}"
+                log.info("Auto-convert memory → pointer: %s (hindsight_key=%s)", brief, hindsight_key)
+
+                # 🛡️ 安全兜底: 短内容+指针格式 = 用户传了已格式化的指针而非全文
+                #   此时 obsidian/hindsight 只能存到短关键词，失去上下文。
+                #   正确用法: memory(action='add', content='完整描述性文本')
+                if len(content_stripped) < 100 and has_pointer:
+                    log.warning(
+                        "三层写入可能不完整: content=%d chars, 含→ h:指针格式. "
+                        "obsidian/hindsight 将只存到关键词而非全文. "
+                        "请用完整描述文本(>100字符)调用 memory(), key=%s",
+                        len(content_stripped), hindsight_key
+                    )
+
+                # Fire-and-forget hindsight retain
+                try:
+                    # Build tags: base + auto-inferred scene/entity + pass-through
+                    extra_tags = ["auto-memory", f"key:{hindsight_key}"]
+
+                    # P1: 自动推断场景标签（stock/dev/life/project/trading）
+                    scene_tag = _infer_scene_tag(content_stripped)
+                    if scene_tag and scene_tag not in extra_tags:
+                        extra_tags.append(scene_tag)
+
+                    # P2: 自动推断 AMAP entity 标签（基于内容关键词匹配）
+                    for entity_tag in _infer_entity_tags(content_stripped):
+                        if entity_tag not in extra_tags:
+                            extra_tags.append(entity_tag)
+
+                    # P3: 内容含显式 [AMAP] 路由标记 → 透传实体标签
+                    if "[AMAP]" in content_stripped:
+                        for tag in ("entity|concept:amap_routing",):
+                            if tag not in extra_tags:
+                                extra_tags.append(tag)
+                        for line in content_stripped.split("\n"):
+                            m = re.search(r'→\s*(entity\|\w+:\w+)', line)
+                            if m and m.group(1) not in extra_tags:
+                                extra_tags.append(m.group(1))
+
+                    # P4: 内容含显式 entity|/relation| 标记 → 透传
+                    if "entity|" in content_stripped or "relation|" in content_stripped:
+                        for line in content_stripped.split("\n"):
+                            line = line.strip()
+                            if line.startswith(("entity|", "relation|")) or "|entity|" in line:
+                                m = re.search(r'(entity\|\w+:\w+|relation\|\w+:\w+)', line)
+                                if m and m.group(1) not in extra_tags:
+                                    extra_tags.append(m.group(1))
+
+                    # ── 三层写入：摘要→hindsight，全文→wiki ──
+                    # 第1层：写全文到 Obsidian wiki
+                    obsidian_path = None
+                    try:
+                        obsidian_path = _write_obsidian_raw(
+                            content_stripped,
+                            scene_tag or 'memory',
+                            hindsight_key
+                        )
+                    except Exception as e:
+                        log.warning("Obsidian raw write failed: %s", e)
+
+                    # 第2层：摘要+指针存到 hindsight
+                    summary = _extract_summary(content_stripped)
+                    if obsidian_path:
+                        hindsight_content = summary  # 原文放tags里，不走content（不会被LLM洗掉）
+                        extra_tags.append(f"ref_obsidian:{obsidian_path}")
+                    else:
+                        hindsight_content = summary
+
+                    payload = json.dumps({
+                        "items": [{
+                            "content": hindsight_content,
+                            "tags": extra_tags,
+                            "context": "auto-converted",
+                            "strategy": "raw",
+                        }]
+                    })
+                    subprocess.run(
+                        ["curl", "-s", "-X", "POST",
+                         "http://127.0.0.1:9177/v1/default/banks/hermes/memories",
+                         "-H", "Content-Type: application/json", "-d", payload],
+                        capture_output=True, timeout=10,
+                    )
+                except Exception:
+                    pass
+
+                # 写指针到 recent_macro.md 详情索引区（替代写入 MEMORY.md）
+                try:
+                    macro_path = os.path.expanduser("~/wiki/docs/agent-memory/recent_macro.md")
+                    date_str = datetime.now().strftime("%m-%d")
+                    pointer_line = f"- {brief} → h:{hindsight_key} [{date_str}]"
+                    os.makedirs(os.path.dirname(macro_path), exist_ok=True)
+                    if os.path.exists(macro_path):
+                        with open(macro_path) as f:
+                            content_lines = f.readlines()
+                        # 找到详情索引区，追加到该区域末尾
+                        in_detail = False
+                        inserted = False
+                        new_lines = []
+                        for line in content_lines:
+                            new_lines.append(line)
+                            if line.strip().startswith("## 近期详情索引"):
+                                in_detail = True
+                                continue
+                            if in_detail:
+                                if line.strip().startswith("## ") or line.strip().startswith("---"):
+                                    # 到下一个章节了，在当前章节末尾插入
+                                    new_lines.insert(-1, pointer_line + "\n")
+                                    inserted = True
+                                    in_detail = False
+                        if not inserted:
+                            # 没有详情索引区，追加一个
+                            new_lines.append("\n## 近期详情索引\n")
+                            new_lines.append(pointer_line + "\n")
+                        with open(macro_path, "w") as f:
+                            f.writelines(new_lines)
+                    else:
+                        with open(macro_path, "w") as f:
+                            f.write("# 近期宏观记忆（最近14天滚动）\n\n")
+                            f.write("## 宏观结论\n\n")
+                            f.write("## 近期详情索引\n")
+                            f.write(pointer_line + "\n")
+                            f.write("\n---\n")
+                except Exception as macro_e:
+                    log.warning("Write to recent_macro.md failed: %s", macro_e)
+
+                # 非 [CORE] 内容不写 MEMORY.md，设为空跳过
+                content = ""
+
     if action == "add":
-        if not content:
+        if not content and target == "memory":
+            # 非 [CORE] 内容已通过 auto-convert 写入 hindsight + recent_macro.md
+            result = {"success": True, "message": "内容已写入 hindsight 和宏观索引"}
+        elif not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
+        else:
+            result = store.add(target, content)
 
     elif action == "replace":
         if not old_text:
