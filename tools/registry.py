@@ -27,13 +27,17 @@ logger = logging.getLogger(__name__)
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
-    """Return True when *node* is a ``registry.register(...)`` call expression."""
+    """Return True when *node* is a ``registry.register(...)`` or ``registry.register_pre_hook(...)`` call.
+
+    Both methods register tools or pre-hooks that the discovery system
+    needs to know about.
+    """
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
         return False
     func = node.value.func
     return (
         isinstance(func, ast.Attribute)
-        and func.attr == "register"
+        and func.attr in ("register", "register_pre_hook")
         and isinstance(func.value, ast.Name)
         and func.value.id == "registry"
     )
@@ -155,8 +159,10 @@ class ToolRegistry:
         self._tools: Dict[str, ToolEntry] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
+        # Pre-hooks: {target_tool_name: [hook_fn, ...]}
+        # hook_fn signature: (name: str, args: dict) -> Optional[str]
+        self._pre_hooks: Dict[str, List[Callable]] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
-        # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
         self._lock = threading.RLock()
         # Monotonically-increasing generation counter. Bumped on every
@@ -331,6 +337,28 @@ class ToolRegistry:
         logger.debug("Deregistered tool: %s", name)
 
     # ------------------------------------------------------------------
+    # Pre-hooks
+    # ------------------------------------------------------------------
+
+    def register_pre_hook(self, target_tool: str, hook_fn: Callable) -> None:
+        """Register a pre-hook that runs before a tool is dispatched.
+
+        ``hook_fn`` signature: ``(tool_name: str, args: dict) -> str | None``
+        If the hook returns a string, it's prepended to the tool's result.
+
+        Multiple hooks can be registered on the same tool; they run in
+        registration order.
+        """
+        with self._lock:
+            if target_tool not in self._pre_hooks:
+                self._pre_hooks[target_tool] = []
+            self._pre_hooks[target_tool].append(hook_fn)
+            logger.debug(
+                "Pre-hook registered for tool '%s' (%d total)",
+                target_tool, len(self._pre_hooks[target_tool]),
+            )
+
+    # ------------------------------------------------------------------
     # Schema retrieval
     # ------------------------------------------------------------------
 
@@ -390,18 +418,38 @@ class ToolRegistry:
     def dispatch(self, name: str, args: dict, **kwargs) -> str:
         """Execute a tool handler by name.
 
+        * Pre-hooks registered on this tool run in order before the handler.
         * Async handlers are bridged automatically via ``_run_async()``.
-        * All exceptions are caught and returned as ``{"error": "..."}``
+        * All exceptions are caught and returned as {"error": "..."}
           for consistent error format.
         """
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+
+        # -- Run pre-hooks (snapshot under lock, execute outside) --
+        pre_outputs: list[str] = []
+        with self._lock:
+            hooks = list(self._pre_hooks.get(name, []))
+        for hook in hooks:
+            try:
+                result = hook(name, args)
+                if result and isinstance(result, str):
+                    pre_outputs.append(result)
+            except Exception as e:
+                logger.debug("Pre-hook for tool '%s' failed: %s", name, e)
+
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = entry.handler(args, **kwargs)
+
+            if pre_outputs:
+                context = "\n\n".join(pre_outputs)
+                return context + "\n\n" + result
+            return result
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences
