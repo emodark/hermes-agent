@@ -3232,35 +3232,38 @@ def run_conversation(
                 # 工具执行完毕后，从工具结果中提取实体，做二次 prefetch
                 # 结果用于下一轮 LLM 调用的辅助参考（主路仍是原始 user query）
                 try:
-                    _tool_results = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
-                    if _tool_results:
-                        _entities = []
-                        # 从最近的 tool result 提取关键词（取最后 3 条）
-                        for _tr in _tool_results[-3:]:
-                            _name = (_tr.get("name") or "")
-                            _content = (_tr.get("content") or "")
-                            if isinstance(_content, str) and len(_content) > 20:
-                                _entities.append(f"{_name}: {_content[:200]}")
-                            elif isinstance(_content, str):
-                                _entities.append(f"{_name}: {_content}")
-                        if _entities:
-                            _entity_query = " | ".join(_entities)
-                            _raw = agent._memory_manager.prefetch_all(
-                                _entity_query, max_chars=200,
-                            ) or ""
-                            # 增量去重：如果辅路结果与主路高度重叠，跳过
-                            if _raw and _ext_prefetch_cache:
-                                _overlap_ratio = _text_overlap_ratio(_raw, _ext_prefetch_cache)
-                            else:
-                                _overlap_ratio = 0.0
-                            if _overlap_ratio > 0.8:
-                                logger.debug(
-                                    "Aux prefetch skipped: %.0f%% overlap with primary",
-                                    _overlap_ratio * 100,
-                                )
-                                _aux_prefetch = ""
-                            else:
-                                _aux_prefetch = _raw
+                    if agent._memory_manager is None:
+                        _aux_prefetch = ""
+                    else:
+                        _tool_results = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
+                        if _tool_results:
+                            _entities = []
+                            # 从最近的 tool result 提取关键词（取最后 3 条）
+                            for _tr in _tool_results[-3:]:
+                                _name = (_tr.get("name") or "")
+                                _content = (_tr.get("content") or "")
+                                if isinstance(_content, str) and len(_content) > 20:
+                                    _entities.append(f"{_name}: {_content[:200]}")
+                                elif isinstance(_content, str):
+                                    _entities.append(f"{_name}: {_content}")
+                            if _entities:
+                                _entity_query = " | ".join(_entities)
+                                _raw = agent._memory_manager.prefetch_all(
+                                    _entity_query, max_chars=200,
+                                ) or ""
+                                # 增量去重：如果辅路结果与主路高度重叠，跳过
+                                if _raw and _ext_prefetch_cache:
+                                    _overlap_ratio = _text_overlap_ratio(_raw, _ext_prefetch_cache)
+                                else:
+                                    _overlap_ratio = 0.0
+                                if _overlap_ratio > 0.8:
+                                    logger.debug(
+                                        "Aux prefetch skipped: %.0f%% overlap with primary",
+                                        _overlap_ratio * 100,
+                                    )
+                                    _aux_prefetch = ""
+                                else:
+                                    _aux_prefetch = _raw
                 except Exception as exc:
                     logger.warning("Aux prefetch failed: %s", exc)
                     _aux_prefetch = ""
