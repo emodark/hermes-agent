@@ -26,6 +26,7 @@ Usage in run_agent.py:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import inspect
 from typing import Any, Dict, List, Optional
@@ -336,24 +337,89 @@ class MemoryManager:
 
     # -- Prefetch / recall ---------------------------------------------------
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
-        """Collect prefetch context from all providers.
+    # Per-layer character budgets (used to truncate individual items)
+    # 校准模式：CRITICAL 只保留 200 字符，其余层被总预算裁剪
+    _LAYER_BUDGETS: Dict[str, int] = {
+        MemoryProvider.LAYER_CRITICAL: 200,
+        MemoryProvider.LAYER_HIGH: 10000,
+        MemoryProvider.LAYER_NORMAL: 50000,
+        MemoryProvider.LAYER_BACKGROUND: 0,  # no individual truncation
+    }
+    # Layer priority order (highest first, used for budget allocation)
+    _LAYER_PRIORITY: List[str] = [
+        MemoryProvider.LAYER_CRITICAL,
+        MemoryProvider.LAYER_HIGH,
+        MemoryProvider.LAYER_NORMAL,
+        MemoryProvider.LAYER_BACKGROUND,
+    ]
 
-        Returns merged context text labeled by provider. Empty providers
-        are skipped. Failures in one provider don't block others.
+    def prefetch_all(self, query: str, *, session_id: str = "",
+                     max_chars: int = 200) -> str:
+        """收集分层 prefetch 校准上下文，总预算 ≤200 字符。
+
+        校准模式说明：
+        - 各 provider 返回分层结果（critical > high > normal > background）
+        - 按优先级合并，在 ``max_chars`` 预算内优先填充高优先级层
+        - CRITICAL 层单条上限 200 字符，超出直接截断
+        - 任一 provider 失败不阻塞其他 provider
+        - 未实现 ``prefetch_layered`` 的 provider 走 fallback，结果归入 NORMAL 层
+
+        Args:
+            query: 用户消息，用于 provider 检索
+            session_id: 可选的会话 ID
+            max_chars: 总预算字符数，默认 200（校准模式）
         """
-        parts = []
+        # 1. Collect layers from all providers
+        all_layers: Dict[str, List[str]] = {k: [] for k in self._LAYER_PRIORITY}
         for provider in self._providers:
             try:
-                result = provider.prefetch(query, session_id=session_id)
-                if result and result.strip():
-                    parts.append(result)
+                layers = provider.prefetch_layered(query, session_id=session_id)
+                for layer_key, text in layers.items():
+                    if text and text.strip():
+                        norm_key = layer_key if layer_key in all_layers else MemoryProvider.LAYER_NORMAL
+                        all_layers[norm_key].append(text)
             except Exception as e:
                 logger.debug(
-                    "Memory provider '%s' prefetch failed (non-fatal): %s",
+                    "Memory provider '%s' prefetch_layered failed (non-fatal): %s",
                     provider.name, e,
                 )
-        return "\n\n".join(parts)
+                # Fallback: try legacy prefetch() as normal layer
+                try:
+                    text = provider.prefetch(query, session_id=session_id)
+                    if text and text.strip():
+                        all_layers[MemoryProvider.LAYER_NORMAL].append(text)
+                except Exception:
+                    pass
+
+        # 2. Build result within budget, highest priority first
+        parts: List[str] = []
+        remaining = max_chars
+        for layer_key in self._LAYER_PRIORITY:
+            for text in all_layers[layer_key]:
+                # Apply per-layer budget truncation
+                budget = self._LAYER_BUDGETS.get(layer_key, 0)
+                if budget > 0 and len(text) > budget:
+                    logger.debug(
+                        "Layer '%s' truncated: %d chars > %d budget",
+                        layer_key, len(text), budget,
+                    )
+                    text = text[:budget]
+                # Skip if still over remaining budget
+                if len(text) > remaining:
+                    logger.debug(
+                        "Layer '%s' skipped (%d chars): exceeds remaining budget %d",
+                        layer_key, len(text), remaining,
+                    )
+                    continue
+                parts.append(text)
+                remaining -= len(text)
+
+        result = "\n\n".join(parts)
+        logger.debug(
+            "prefetch_all: %d chars from %d items (budget %d, remaining %d)",
+            len(result), len(parts), max_chars, remaining,
+        )
+        return result
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn."""
@@ -409,6 +475,69 @@ class MemoryManager:
                     "Memory provider '%s' sync_turn failed: %s",
                     provider.name, e,
                 )
+
+    # -- Calibration ----------------------------------------------------------
+
+    CALIBRATION_PATH = "~/.hermes/hermes-agent/agent/calibration.md"
+
+    def _write_calibration(self) -> None:
+        """收集外部系统状态，写入 calibration.md 供下轮 prefetch 使用。
+
+        只包含对话历史里看不到的信息：系统健康、后台任务结果、错误计数。
+        200 字符以内，紧凑格式。
+        """
+        import subprocess
+        from datetime import datetime
+
+        now = datetime.now().strftime("%m-%d %H:%M")
+        parts = [f"⟲{now}"]
+
+        # 1. Gateway 状态
+        try:
+            r = subprocess.run(
+                ["systemctl", "--user", "is-active", "hermes-gateway"],
+                capture_output=True, text=True, timeout=2,
+            )
+            state = r.stdout.strip()
+            if state in ("active", "inactive", "failed"):
+                parts.append(f"gw={state}")
+        except Exception:
+            pass
+
+        # 2. 最近 10 分钟错误数
+        try:
+            r = subprocess.run(
+                ["journalctl", "--user", "-u", "hermes-gateway",
+                 "--since", "10 min ago", "--no-pager", "-p", "err"],
+                capture_output=True, text=True, timeout=2,
+            )
+            errors = [l for l in r.stdout.split("\n")
+                      if l.strip() and "auth could not" not in l]
+            if errors:
+                parts.append(f"err={len(errors)}")
+        except Exception:
+            pass
+
+        # 3. 最近 cron 输出时间
+        try:
+            import glob
+            cron_dir = os.path.expanduser("~/.hermes/cron/output/")
+            dirs = sorted(glob.glob(os.path.join(cron_dir, "*/")))
+            if dirs:
+                files = sorted(glob.glob(os.path.join(dirs[-1], "*.md")))
+                if files:
+                    fname = os.path.basename(files[-1]).replace(".md", "")
+                    parts.append(f"cron={fname[:15]}")
+        except Exception:
+            pass
+
+        text = "|".join(parts)[:200]
+
+        # 写入文件
+        cal_path = os.path.expanduser(self.CALIBRATION_PATH)
+        os.makedirs(os.path.dirname(cal_path), exist_ok=True)
+        with open(cal_path, "w") as f:
+            f.write(text + "\n")
 
     # -- Tools ---------------------------------------------------------------
 

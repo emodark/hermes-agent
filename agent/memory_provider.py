@@ -91,7 +91,7 @@ class MemoryProvider(ABC):
         return ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Recall relevant context for the upcoming turn.
+        """Recall relevant context for the upcoming turn (legacy single-layer).
 
         Called before each API call. Return formatted text to inject as
         context, or empty string if nothing relevant. Implementations
@@ -101,8 +101,34 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+
+        .. note::
+           New providers should override ``prefetch_layered()`` instead.
+           This method is kept for backward compatibility; the default
+           ``prefetch_layered()`` implementation delegates to it.
         """
         return ""
+
+    # Layer priority constants (highest → lowest)
+    LAYER_CRITICAL = "critical"      # Must-include, truncate at ~2K chars
+    LAYER_HIGH = "high"              # Important, truncate at ~10K chars
+    LAYER_NORMAL = "normal"          # Useful, truncate at ~50K chars
+    LAYER_BACKGROUND = "background"  # Nice-to-have, no strict truncation
+
+    def prefetch_layered(self, query: str, *, session_id: str = "") -> Dict[str, str]:
+        """Return layered prefetch context for budget-aware allocation.
+
+        Returns dict mapping layer keys (LAYER_CRITICAL / LAYER_HIGH /
+        LAYER_NORMAL / LAYER_BACKGROUND) to their text content.
+
+        Default implementation wraps ``prefetch()`` as a single NORMAL
+        layer. Override to provide multiple priority tiers so the
+        MemoryManager can allocate context budget optimally.
+        """
+        text = self.prefetch(query, session_id=session_id)
+        if text:
+            return {self.LAYER_NORMAL: text}
+        return {}
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall for the NEXT turn.

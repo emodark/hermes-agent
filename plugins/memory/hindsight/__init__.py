@@ -555,6 +555,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
+        self._prefetch_raw = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
@@ -1312,6 +1313,187 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    @staticmethod
+    def _read_calibration() -> str:
+        """读取 calibration.md，返回裸文本（无包装）。
+
+        calibration.md 由 memory_manager._write_calibration() 在每轮对话同步后写入，
+        包含 gateway 状态、错误数、最近 cron 结果等外部系统信息。
+        """
+        try:
+            path = os.path.expanduser("~/.hermes/hermes-agent/agent/calibration.md")
+            if not os.path.exists(path):
+                return ""
+            with open(path) as f:
+                text = f.read().strip()
+            return text
+        except Exception:
+            return ""
+
+    def prefetch_layered(self, query: str, *, session_id: str = "") -> Dict[str, str]:
+        """返回校准上下文（CRITICAL 层，≤200 字符）。
+
+        校准数据来源：上一轮结束后 queue_prefetch 启动的知识路由。
+        知识路由基于上一轮用户消息搜索 hindsight 记忆 + wiki + 实体图 + skill。
+        提取时优先用本地 0.5B LLM 做摘要，失败则回退到文本规则提取。
+
+        如果是首轮（线程未跑过），返回空。
+        """
+        # 1. 等后台线程完成
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            logger.debug("Calibration: waiting for knowledge_router background thread")
+            self._prefetch_thread.join(timeout=15.0)
+
+        # 2. 取原始路由输出（已存成 plain text，不是节段格式）
+        with self._prefetch_lock:
+            raw = self._prefetch_raw
+            self._prefetch_raw = ""
+
+        if not raw:
+            return {}
+
+        # 3. 一次提取校准摘要（LLM → 文本规则 fallback）
+        calibrated = self._extract_router_calibration(raw, max_chars=200)
+        if calibrated:
+            logger.debug(
+                "Calibration: %d chars extracted", len(calibrated),
+            )
+            return {self.LAYER_CRITICAL: calibrated}
+        return {}
+
+    _calibration_llm = None  # 类级别缓存，懒加载
+
+    def _get_calibration_llm(self):
+        """懒加载本地校准模型（qwen2.5-0.5b-instruct Q4_K_M）。"""
+        if self.__class__._calibration_llm is not None:
+            return self.__class__._calibration_llm
+
+        model_path = "/home/john/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+        if not os.path.exists(model_path):
+            logger.debug("Calibration LLM: model file not found at %s", model_path)
+            self.__class__._calibration_llm = False
+            return None
+
+        try:
+            from llama_cpp import Llama
+            llm = Llama(
+                model_path=model_path,
+                n_ctx=512,
+                n_threads=4,
+                n_gpu_layers=0,
+                verbose=False,
+            )
+            self.__class__._calibration_llm = llm
+            logger.debug("Calibration LLM: loaded (%.1f MB, 0.5B)", os.path.getsize(model_path) / 1e6)
+            return llm
+        except Exception as e:
+            logger.debug("Calibration LLM: load failed: %s", e)
+            self.__class__._calibration_llm = False
+            return None
+
+    def _extract_router_calibration(
+        self, raw: str, max_chars: int = 200,
+    ) -> str:
+        """从 knowledge_router 输出中提取校准摘要（≤200字符）。
+
+        优先用本地 0.5B LLM 做紧凑摘要，失败则回退文本规则提取。
+
+        路由的输出结构：
+         🧠 [hindsight]  — 语义记忆回忆
+         🗂️ [wiki]       — 知识库匹配
+         🔗 [graph]      — 实体图关联
+         🧰 [skill]      — 技能推荐
+        """
+        if not raw:
+            return ""
+
+        # ── 1. LLM 摘要（优先） ──────────────────────────────────────
+        llm = self._get_calibration_llm()
+        if llm:
+            try:
+                out = llm.create_chat_completion(
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"将以下信息压缩为一句话校准摘要（≤{max_chars}字符），"
+                            "保留关键实体、结论和因果关系。"
+                            "只输出一行，不加任何说明。\n\n"
+                            f"{raw[:1500]}"
+                        ),
+                    }],
+                    max_tokens=60,
+                    temperature=0,
+                )
+                text = out["choices"][0]["message"]["content"].strip()
+                # 去掉可能的引号/前缀
+                text = text.strip("「」\"''\n")
+                if text:
+                    return text[:max_chars]
+            except Exception as e:
+                logger.debug("Calibration LLM: inference failed: %s", e)
+
+        # ── 2. 文本规则提取（fallback） ──────────────────────────────
+        sections: dict[str, list[str]] = {
+            "hindsight": [], "wiki": [], "graph": [], "skill": [],
+        }
+        current = None
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if "[hindsight]" in stripped:
+                current = sections["hindsight"]
+                continue
+            elif "[wiki]" in stripped:
+                current = sections["wiki"]
+                continue
+            elif "[graph]" in stripped:
+                current = sections["graph"]
+                continue
+            elif "[skill]" in stripped:
+                current = sections["skill"]
+                continue
+            if current is not None and not stripped.startswith(("📌", "🏷️", "📊")):
+                current.append(stripped)
+
+        parts = []
+        # hindsight
+        for h in sections["hindsight"]:
+            text = h.strip()
+            if text and not text.startswith("rel="):
+                parts.append(f"🧠{text[:80]}")
+                break
+        # wiki
+        for w in sections["wiki"]:
+            text = w.strip()
+            if text and not text.startswith("rel="):
+                parts.append(f"🗂️{text[:60]}")
+                break
+        # skill
+        for s in sections["skill"]:
+            clean = s.lstrip("🧰 ").strip()
+            if clean.startswith("技能:"):
+                name = clean[len("技能:"):].strip()
+                parts.append(f"🧰{name[:40]}")
+                break
+        # graph（关联记忆优先，实体名次之）
+        graph_found = False
+        for g in sections["graph"]:
+            if g.startswith("关联记忆:"):
+                mem = g[len("关联记忆:"):].strip()
+                parts.append(f"🔗{mem[:80]}")
+                graph_found = True
+                break
+        if not graph_found:
+            for g in sections["graph"]:
+                if g.startswith("关联实体:"):
+                    ent = g[len("关联实体:"):].strip()
+                    parts.append(f"🔗{ent[:30]}")
+                    break
+
+        result = "|".join(parts)
+        return result[:max_chars]
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1327,24 +1509,41 @@ class HindsightMemoryProvider(MemoryProvider):
             query = query[:self._recall_max_input_chars]
 
         def _run():
+            """背景线程：跑知识路由（联想记忆+wiki+skill），存原始输出供 prefetch 提取。"""
+            import subprocess
             try:
-                # 读 recent_macro.md 作为 prefetch 全部内容（宏观结论+详情索引）
-                macro_path = os.path.expanduser("~/wiki/docs/agent-memory/recent_macro.md")
-                text = ""
-                if os.path.exists(macro_path):
-                    with open(macro_path) as f:
-                        text = f.read().strip()
-                    logger.debug("Prefetch: loaded macro file (%d chars)", len(text))
-                else:
-                    logger.debug("Prefetch: macro file not found")
+                _q = query.strip()
+                if not _q:
+                    return
+                router_script = os.path.expanduser(
+                    "~/.hermes/scripts/knowledge_router.py"
+                )
+                proc = subprocess.run(
+                    ["python3", router_script, _q, "--all"],
+                    capture_output=True, text=True, timeout=25,
+                )
+                raw = proc.stdout or ""
+                if not raw:
+                    logger.debug("Calibration: knowledge_router returned empty")
+                    return
 
-                if text:
-                    with self._prefetch_lock:
-                        self._prefetch_result = text
+                # 存原始输出，prefetch_layered 做一次提取即可（避免二次提取 bug）
+                with self._prefetch_lock:
+                    self._prefetch_raw = raw
+                logger.debug(
+                    "Calibration: %d chars raw from knowledge_router stored",
+                    len(raw),
+                )
+            except subprocess.TimeoutExpired:
+                logger.debug("Calibration: knowledge_router timed out (15s)")
             except Exception as e:
-                logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
+                logger.debug(
+                    "Calibration: knowledge_router failed: %s", e, exc_info=True,
+                )
 
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
+        self._prefetch_thread = threading.Thread(
+            target=_run, daemon=True, name="hindsight-calibration",
+        )
         self._prefetch_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
@@ -1684,7 +1883,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     import os as _os, tempfile
                     today = date.today().isoformat()
                     vault = _os.environ.get('OBSIDIAN_VAULT_PATH', _os.path.expanduser('~/wiki'))
-                    dir_path = _os.path.join(vault, 'agent-memory', 'raw', today)
+                    dir_path = _os.path.join(vault, 'docs', 'agent-memory', 'raw', today)
                     _os.makedirs(dir_path, exist_ok=True)
 
                     import hashlib
@@ -1907,6 +2106,7 @@ tags: [{scene_tag or 'memory'}]
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
+            self._prefetch_raw = ""
 
         # 3. Now rotate to the new session.
         if parent_session_id:
