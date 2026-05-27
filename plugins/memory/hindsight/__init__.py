@@ -48,6 +48,55 @@ from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
+# ── BM25 索引模块加载器 ─────────────────────────────────
+# 不能用 from tools.bm25_index import ... 因为 Hermes Agent 自带的 tools/
+# 包名冲突，Python 启动时已加载 tools/ 作为系统包。
+# 改用 importlib 直接从文件路径加载。
+import importlib.util as _importlib_util
+_BM25_MODULE: object = None
+_BM25_FILE = os.path.expanduser("~/stockWeeklyAnalyzer/tools/bm25_index.py")
+
+
+def _load_bm25():
+    """加载 BM25 模块（按需，带缓存）。"""
+    global _BM25_MODULE
+    if _BM25_MODULE is not None:
+        return _BM25_MODULE
+    if not os.path.isfile(_BM25_FILE):
+        logger.debug("BM25 module not found at %s", _BM25_FILE)
+        return None
+    try:
+        spec = _importlib_util.spec_from_file_location("bm25_index_local", _BM25_FILE)
+        if spec and spec.loader:
+            mod = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _BM25_MODULE = mod
+            logger.debug("BM25 module loaded from %s", _BM25_FILE)
+            return mod
+    except Exception as e:
+        logger.debug("BM25 module load failed: %s", e)
+    return None
+
+
+# ── 初始化 BM25 索引持久化路径 ─────────────────────────
+_BM25_MODULE = _load_bm25()
+if _BM25_MODULE is not None:
+    try:
+        _BM25_INDEX_DIR = os.path.join(
+            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "hindsight"
+        )
+        os.makedirs(_BM25_INDEX_DIR, exist_ok=True)
+        _BM25_INDEX_FILE = os.path.join(_BM25_INDEX_DIR, "bm25_index.json.gz")
+        _BM25_MODULE.set_index_path(_BM25_INDEX_FILE)
+        _BM25_MODULE.load_or_create_index(_BM25_INDEX_FILE)
+        logger.debug(
+            "BM25 index loaded: %d docs from %s",
+            _BM25_MODULE.get_index().doc_count(),
+            _BM25_INDEX_FILE,
+        )
+    except Exception as e:
+        logger.debug("BM25 index init: %s", e)
+
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.4.22"
@@ -1702,6 +1751,30 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # ── Scene/entity tag inference ──────────────────────────────────
 
+    @staticmethod
+    def _match_scene_keyword(kw: str, text: str) -> bool:
+        """智能场景关键词匹配：中文用子串，英文短词/数字用精确边界，避免假阳性。
+
+        假阳性案例（修复前）：
+        - "pe" 匹配 "people"/"hope"/"type" → 错误触发 scene:stock
+        - "002" 匹配 "0.002" → 错误触发 scene:stock
+        - "api" 匹配 "capital"/"rapid" → 错误触发 scene:dev
+        - "git" 匹配 "digital"/"legit" → 错误触发 scene:dev
+        """
+        # 含中文 → 子串匹配（中文词足够特异）
+        if any('\u4e00' <= ch <= '\u9fff' for ch in kw):
+            return kw in text
+        # 纯数字 → 不允许前面有点号或数字（避免 "0.002"、"3000"），
+        # 后面无限制（允许 "002230" 中匹配 "002" 前缀）
+        if kw.isdigit():
+            return bool(re.search(r'(?<![.\d])' + re.escape(kw), text))
+        # 短英文（≤3字符，纯字母）→ ASCII-only 词边界
+        # 用 (?<![a-zA-Z]) 而非 \\b，因为 Python3 中 \\b 把 CJK 视为 \\w
+        if len(kw) <= 3 and kw.replace('.', '').isalpha():
+            return bool(re.search(r'(?<![a-zA-Z])' + re.escape(kw) + r'(?![a-zA-Z])', text))
+        # 其他（长词如 boll/adx/commit/config 等）→ 子串匹配（足够特异）
+        return kw in text
+
     def _infer_scene(self, content: str) -> Optional[str]:
         """根据内容推断场景标签"""
         c = content.lower()
@@ -1717,7 +1790,7 @@ class HindsightMemoryProvider(MemoryProvider):
             ("scene:research", ["研究", "分析", "推理", "mcts", "深度", "产业链"]),
         ]
         for tag, keywords in scene_patterns:
-            if any(kw in c for kw in keywords):
+            if any(self._match_scene_keyword(kw, c) for kw in keywords):
                 return tag
         return None
 
@@ -1725,7 +1798,14 @@ class HindsightMemoryProvider(MemoryProvider):
         """从内容中推断 AMAP 实体标签"""
         tags = []
         c = content
-        code_match = re.findall(r'\b(?:00|30|60|68)\d{3}\b', c)
+        # 6位A股代码匹配（00/30/60/68开头 + 4位数字）
+        # 边界策略：
+        #   (?<![a-zA-Z0-9]) — 前面不能是字母或数字
+        #   (?<!\d\.)        — 前面不能是「数字.」(排除 "0.002230"，但保留 "sz.002230")
+        #   (?![a-zA-Z0-9])  — 后面不能是字母或数字
+        code_match = re.findall(
+            r'(?<![a-zA-Z0-9])(?<!\d\.)(?:00|30|60|68)\d{4}(?![a-zA-Z0-9])', c
+        )
         for code in code_match:
             tags.append(f"entity|object:stock_{code}")
         tool_match = re.findall(r'tools/[\w_]+|scripts/[\w_]+|src/[\w./]+', c)
@@ -1921,20 +2001,52 @@ tags: [{scene_tag or 'memory'}]
                 except Exception as e:
                     logger.warning("hindsight_retain raw mode failed, falling back to normal: %s", e)
 
-            try:
+            # 内容哈希去重（P1：相同内容跳过 API 调用）
+            import hashlib
+            content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+            retain_doc_id = f"hindsight:{content_hash}"
+            skip_api = False
+            bm25 = _load_bm25()
+            if bm25 is not None:
+                try:
+                    if bm25.has_doc(retain_doc_id):
+                        skip_api = True
+                        logger.debug("hindsight_retain: content hash hit, skipping API call")
+                except Exception:
+                    pass
+
+            # 同步写入本地 BM25 索引（本地操作，微秒级）
+            if bm25 is not None:
+                try:
+                    bm25.add_doc(retain_doc_id, content, {"context": context, "tags": user_tags, "source": "hindsight_retain"})
+                    bm25.save_index()
+                except Exception as bm25_err:
+                    logger.debug("BM25 index sync failed (non-fatal): %s", bm25_err)
+
+            # 通过 writer 队列异步发送到 Hindsight API（P1：fire-and-forget）
+            if not skip_api:
                 retain_kwargs = self._build_retain_kwargs(
                     content,
                     context=context,
                     tags=user_tags,
                 )
-                logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
+                logger.debug("Tool hindsight_retain: queueing, bank=%s, content_len=%d, context=%s",
                              self._bank_id, len(content), context)
-                self._run_hindsight_operation(lambda client: client.aretain(**retain_kwargs))
-                logger.debug("Tool hindsight_retain: success")
-                return json.dumps({"result": "Memory stored successfully."})
-            except Exception as e:
-                logger.warning("hindsight_retain failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to store memory: {e}")
+
+                def _tool_retain_job():
+                    try:
+                        self._run_hindsight_operation(lambda client: client.aretain(**retain_kwargs))
+                        logger.debug("hindsight_retain (async): success")
+                    except Exception as e:
+                        logger.warning("hindsight_retain (async) failed: %s", e)
+
+                self._ensure_writer()
+                self._register_atexit()
+                self._retain_queue.put(_tool_retain_job)
+            else:
+                logger.debug("hindsight_retain: skipped API call (dedup hit)")
+
+            return json.dumps({"result": "Memory stored successfully."})
 
         elif tool_name == "hindsight_recall":
             query = args.get("query", "")
@@ -1960,7 +2072,47 @@ tags: [{scene_tag or 'memory'}]
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                 num_results = len(resp.results) if resp.results else 0
                 logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
+                # 同步查询本地 BM25 索引（P0：关键词搜索加速）
+                bm25_lines = []
+                bm25 = _load_bm25()
+                if bm25 is not None:
+                    try:
+                        # 构建 API 结果的内容哈希集合（用于 BM25 去重）
+                        import hashlib
+                        api_content_hashes = set()
+                        for r in (resp.results or []):
+                            if hasattr(r, 'text') and r.text:
+                                api_content_hashes.add(hashlib.md5(r.text.encode('utf-8')).hexdigest())
+
+                        bm25_results = bm25.search(query, limit=5)
+                        if bm25_results:
+                            has_output = False
+                            idx = 0
+                            for r in bm25_results:
+                                # 去重：跳过与 API 结果重复的 BM25 条目
+                                doc_id = r.get("id", "")
+                                if doc_id.startswith("hindsight:"):
+                                    content_hash = doc_id[len("hindsight:"):]
+                                    if content_hash in api_content_hashes:
+                                        logger.debug("BM25 dedup: skip %s (already in API results)", doc_id)
+                                        continue
+                                # 分数过滤：过低分数丢弃
+                                score = r.get("score", 0)
+                                if score < 0.5:
+                                    continue
+                                idx += 1
+                                if not has_output:
+                                    bm25_lines.append("")
+                                    bm25_lines.append("━ 本地 BM25 关键词检索 ━")
+                                    has_output = True
+                                preview = r.get("content_preview", "")
+                                if score > 5:
+                                    bm25_lines.append(f"BM25#{idx} (score={score:.2f}): {preview}")
+                                else:
+                                    bm25_lines.append(f"BM25#{idx}: {preview}")
+                    except Exception as bm25_err:
+                        logger.debug("BM25 recall failed (non-fatal): %s", bm25_err)
+                if not resp.results and not bm25_lines:
                     return json.dumps({"result": "No relevant memories found."})
                 lines = []
                 for i, r in enumerate(resp.results, 1):
@@ -1968,7 +2120,8 @@ tags: [{scene_tag or 'memory'}]
                     scene_tags = [t for t in r_tags if isinstance(t, str) and t.startswith("scene:")]
                     tag_str = f" [{','.join(scene_tags[:3])}]" if scene_tags else ""
                     lines.append(f"{i}. {r.text}{tag_str}")
-                return json.dumps({"result": "\n".join(lines)})
+                all_lines = lines + bm25_lines
+                return json.dumps({"result": "\n".join(all_lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to search memory: {e}")
