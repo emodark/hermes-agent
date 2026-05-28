@@ -334,6 +334,15 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
     list structure stays valid for vision-capable adapters.
     """
     wrapped = _maybe_wrap_untrusted(name, content)
+    # DeepSeek (and strict OpenAI-compatible providers) 拒绝 content: null
+    # 必须确保始终是 str 或 list。如果 handler 返回了 None 或非法类型，
+    # 兜底为空字符串，不交给 provider 吃 400。
+    if not isinstance(wrapped, (str, list)):
+        if wrapped is None:
+            wrapped = ""
+        else:
+            # dict/其他对象 → 空字符串
+            wrapped = str(wrapped) if wrapped else ""
     return {
         "role": "tool",
         "name": name,

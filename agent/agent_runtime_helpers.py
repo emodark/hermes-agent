@@ -1907,6 +1907,27 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: added %d stub tool result(s)",
             len(missing_results),
         )
+    # 3. Fix null/invalid content on ALL message types (not just tool).
+    #    DeepSeek (and strict OpenAI-compatible providers) reject content: null
+    #    with "content should be a string or a list".  Content must always be
+    #    str or list.  Source fix in make_tool_result_message; this sanitizer
+    #    catches stale history loaded from the session DB + any other edge case.
+    sanitized = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("system", "user", "assistant", "tool"):
+            continue
+        c = msg.get("content")
+        if c is None or not isinstance(c, (str, list)):
+            msg["content"] = ""
+            sanitized += 1
+    if sanitized:
+        _ra().logger.debug(
+            "Pre-call sanitizer: fixed %d message(s) with null/invalid content",
+            sanitized,
+        )
     return messages
 
 
