@@ -4223,6 +4223,11 @@ def run_conversation(
     agent._drop_trailing_empty_response_scaffolding(messages)
     agent._persist_session(messages, conversation_history)
 
+    # 内存泄漏防护：持久化后裁剪消息历史，只保留最近 max_turns 轮
+    # 全量历史已写入 SQLite，旧消息不需要留在内存中
+    messages = agent._trim_messages_history(messages, max_turns=30)
+    agent._session_messages = messages  # 同步更新引用
+
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
     # When the last message is a tool result (agent was mid-work), log

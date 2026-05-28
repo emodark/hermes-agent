@@ -3045,6 +3045,60 @@ class AIAgent:
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 
+    @staticmethod
+    def _trim_messages_history(messages: List[Dict], max_turns: int = 30) -> List[Dict]:
+        """裁剪已持久化的对话历史，防止消息无限增长导致内存泄漏。
+
+        在消息已写入 SQLite 后调用，只保留：
+        - 系统提示词（system prompt）
+        - 前 protect_first（3）轮对话
+        - 后 max_turns（30）轮对话
+
+        中间的旧历史已被持久化到 DB，从内存中移除是安全的。
+        返回裁剪后的新列表，不修改原列表。
+        """
+        if not messages or len(messages) < 50:
+            return messages
+
+        # 以 user 消息作为对话轮次边界
+        user_indices = [
+            i for i, m in enumerate(messages)
+            if isinstance(m, dict) and m.get("role") == "user"
+        ]
+
+        if len(user_indices) <= max_turns:
+            return messages
+
+        # 保留前 3 轮 + 后 N 轮
+        protect_first = min(3, max_turns // 3)
+        keep_last = max_turns - protect_first
+
+        head_end = user_indices[protect_first - 1]  # 最后一个保留的前轮消息索引
+        tail_start = user_indices[-keep_last]       # 第一个保留的后轮消息索引
+
+        # 对齐边界：不把 tool-call 群组截断（对齐到 assistant 消息）
+        # 对齐尾部边界：tail_start 如果指向 tool 结果，前移到所属 assistant
+        while tail_start < len(messages) and messages[tail_start].get("role") == "tool":
+            tail_start += 1
+
+        # 对齐头部边界：head_end 不落在 tool 结果上
+        # 正常情况 head_end 是 user 消息，但确认一下
+        while head_end > 0 and messages[head_end].get("role") == "tool":
+            head_end -= 1
+
+        # 安全检测：裁剪后至少保留 2 轮对话，且不破坏 role alternation
+        trimmed = messages[:head_end + 1] + messages[tail_start:]
+        if len([m for m in trimmed if m.get("role") == "user"]) < 2:
+            return messages  # 保留太少，回退
+
+        logger.info(
+            "Trimmed conversation history: %d → %d messages "
+            "(kept first %d + last %d of %d user turns)",
+            len(messages), len(trimmed), protect_first, keep_last,
+            len(user_indices),
+        )
+        return trimmed
+
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
         Get messages up to (but not including) the last assistant turn.
