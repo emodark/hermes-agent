@@ -1912,6 +1912,10 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     #    with "content should be a string or a list".  Content must always be
     #    str or list.  Source fix in make_tool_result_message; this sanitizer
     #    catches stale history loaded from the session DB + any other edge case.
+    #
+    #    Recursive defense: for list-type content, also scrub any null/invalid
+    #    text fields inside content parts.  Some providers reject
+    #    {"type": "text", "text": null} even when the top-level content is a valid list.
     sanitized = 0
     for msg in messages:
         if not isinstance(msg, dict):
@@ -1923,6 +1927,17 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if c is None or not isinstance(c, (str, list)):
             msg["content"] = ""
             sanitized += 1
+        elif isinstance(c, list):
+            # Deep scan list-type content for null/invalid text parts
+            fixed_parts = False
+            for part in c:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and part.get("text") is None:
+                    part["text"] = ""
+                    fixed_parts = True
+            if fixed_parts:
+                sanitized += 1
     if sanitized:
         _ra().logger.debug(
             "Pre-call sanitizer: fixed %d message(s) with null/invalid content",
