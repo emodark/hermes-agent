@@ -821,6 +821,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        # HERMES_LARK_CRON_DELIVER_BEGIN
+        try:
+            if platform_name.lower() in ('feishu', 'lark'):
+                from hermes_lark_streaming.patch import on_cron_deliver
+                if on_cron_deliver(chat_id=chat_id, content=cleaned_delivery_content.strip(), loop=loop):
+                    delivered = True
+                    continue
+        except Exception:
+            pass
+        # HERMES_LARK_CRON_DELIVER_END
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
