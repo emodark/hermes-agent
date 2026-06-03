@@ -4217,6 +4217,15 @@ class AIAgent:
         if skills_prompt:
             prompt_parts.append(skills_prompt)
 
+        # ── Instinct system: inject learned behavioral patterns ──
+        try:
+            from agent.instincts import inject_instincts_prompt
+            instinct_prompt = inject_instincts_prompt(threshold=0.9, max_chars=300)
+            if instinct_prompt:
+                prompt_parts.append(instinct_prompt)
+        except Exception:
+            pass
+
         if not self.skip_context_files:
             # Use TERMINAL_CWD for context file discovery when set (gateway
             # mode).  The gateway process runs from the hermes-agent install

@@ -33,6 +33,12 @@ _INSTINCTS_FILE = _INSTINCTS_DIR / "instincts.yaml"
 # Minimum observations to attempt analysis
 _MIN_OBSERVATIONS_FOR_ANALYSIS = 20
 
+# Rolling window — observations beyond this count are trimmed (oldest dropped)
+# Keeps the JSONL file bounded. 10K observations ≈ 3MB on disk.
+_MAX_OBSERVATIONS = 10000
+_TRIM_CHECK_INTERVAL = 50  # check file size every N writes (probabilistic, not per-write IO)
+_write_counter = 0  # module-level counter for probabilistic trim check
+
 
 # ---------------------------------------------------------------------------
 # Observation helpers
@@ -50,9 +56,37 @@ def _safe_truncate(obj: Any, max_chars: int = 200) -> str:
     return text
 
 
+def _maybe_trim_observations(max_lines: int = _MAX_OBSERVATIONS) -> None:
+    """Trim observations file to keep only the most recent max_lines.
+
+    Called probabilistically from record_observation() to keep the JSONL
+    file bounded. Uses 20% hysteresis to avoid thrashing.
+    Non-blocking — errors are caught and logged at DEBUG level.
+    """
+    try:
+        if not _OBSERVATIONS_FILE.exists():
+            return
+
+        with open(_OBSERVATIONS_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        if len(lines) <= int(max_lines * 1.2):
+            return
+
+        with open(_OBSERVATIONS_FILE, "w", encoding="utf-8") as f:
+            f.writelines(lines[-max_lines:])
+
+        logger.info(
+            f"Trimmed observations to {max_lines} lines (was {len(lines)})"
+        )
+    except Exception as e:
+        logger.debug(f"Instinct trim failed (non-critical): {e}")
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def record_observation(
     tool_name: str,
@@ -109,6 +143,12 @@ def record_observation(
         with open(_OBSERVATIONS_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(observation, ensure_ascii=False) + "\n")
 
+        # Probabilistic trim check — keeps file bounded without per-write IO
+        global _write_counter
+        _write_counter += 1
+        if _write_counter % _TRIM_CHECK_INTERVAL == 0:
+            _maybe_trim_observations()
+
     except Exception as e:
         logger.debug(f"Instinct observation failed (non-critical): {e}")
 
@@ -119,13 +159,46 @@ def get_high_confidence_instincts(threshold: float = 0.7, max_instincts: int = 1
     return [i for i in instincts if i.get("confidence", 0) >= threshold][:max_instincts]
 
 
-def inject_instincts_prompt(threshold: float = 0.7) -> str:
+# ── Prompt cache ────────────────────────────────────────
+_INSTINCT_PROMPT_CACHE: Dict[str, str] = {}
+_INSTINCT_PROMPT_CACHE_TS: float = 0
+_INSTINCT_PROMPT_CACHE_TTL: float = 900  # 15 分钟
+
+
+def inject_instincts_prompt(threshold: float = 0.7, max_chars: int = 400) -> str:
     """Build a system prompt block from high-confidence instincts.
 
+    Args:
+        threshold: Minimum confidence to include (0.0-1.0)
+        max_chars: Hard character limit for the entire block.
+                  Longer content is trimmed from the lowest-confidence end.
+
     Returns empty string if no high-confidence instincts exist.
+    Uses 15-minute in-memory cache keyed by max_chars to avoid repeated YAML IO.
     """
-    instincts = get_high_confidence_instincts(threshold)
+    global _INSTINCT_PROMPT_CACHE, _INSTINCT_PROMPT_CACHE_TS
+    cache_key = f"mc={max_chars}"
+    now = time.monotonic()
+    if cache_key in _INSTINCT_PROMPT_CACHE and (now - _INSTINCT_PROMPT_CACHE_TS) < _INSTINCT_PROMPT_CACHE_TTL:
+        return _INSTINCT_PROMPT_CACHE[cache_key]
+
+    instincts = get_high_confidence_instincts(threshold, max_instincts=20)
     if not instincts:
+        _INSTINCT_PROMPT_CACHE[cache_key] = ""
+        _INSTINCT_PROMPT_CACHE_TS = now
+        return ""
+
+    # Sort by confidence descending, then build incrementally
+    instincts.sort(key=lambda i: i.get("confidence", 0), reverse=True)
+
+    header = "<instincts>\nThe following behavior patterns have been observed:\n"
+    footer = "\n</instincts>"
+    # Reserve space: len(header) + len(footer) + overhead per line
+    reserved = len(header) + len(footer) + 20
+    budget = max_chars - reserved
+    if budget <= 0:
+        _INSTINCT_PROMPT_CACHE[cache_key] = ""
+        _INSTINCT_PROMPT_CACHE_TS = now
         return ""
 
     blocks = []
@@ -134,16 +207,21 @@ def inject_instincts_prompt(threshold: float = 0.7) -> str:
         desc = instinct.get("description", "")
         conf = instinct.get("confidence", 0)
         domain = instinct.get("domain", "general")
-        blocks.append(f"- [{domain}] {desc} (confidence: {conf:.1%})")
+        line = f"- [{domain}] {desc} (confidence: {conf:.0%})"
+        # Check if adding this line would exceed budget
+        candidate = "\n".join(blocks + [line])
+        if len(candidate) > budget:
+            break  # stop adding — ran out of chars
+        blocks.append(line)
 
-    prompt = "\n".join([
-        "",
-        "<instincts>",
-        "The following behavior patterns have been observed in this workspace:",
-        *blocks,
-        "These are learned preferences — follow them unless the current task explicitly requires otherwise.",
-        "</instincts>",
-    ])
+    if not blocks:
+        _INSTINCT_PROMPT_CACHE[cache_key] = ""
+        _INSTINCT_PROMPT_CACHE_TS = now
+        return ""
+
+    prompt = "\n".join(["", header, *blocks, footer])
+    _INSTINCT_PROMPT_CACHE[cache_key] = prompt
+    _INSTINCT_PROMPT_CACHE_TS = now
     return prompt
 
 
