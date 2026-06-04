@@ -145,13 +145,27 @@ RETAIN_SCHEMA = {
     "name": "hindsight_retain",
     "description": (
         "Store information to long-term memory. Hindsight automatically "
-        "extracts structured facts, resolves entities, and indexes for retrieval."
+        "extracts structured facts, resolves entities, and indexes for retrieval.\n\n"
+        "Multi-granularity support: optionally provide summary + keywords to "
+        "build multi-level indexing — enables pinpoint recall via summary-level "
+        "matching and keyword-level matching alongside the full-text embedding."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "The information to store."},
             "context": {"type": "string", "description": "Short label (e.g. 'user preference', 'project decision')."},
+            "summary": {
+                "type": "string",
+                "description": "One-sentence summary of the memory (summary-granularity). "
+                "Stored as context if context is not already set. Enables recall matching at summary level.",
+            },
+            "keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Key searchable terms (keyword-granularity). "
+                "Merged into tags for keyword-level recall matching.",
+            },
             "tags": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1293,6 +1307,43 @@ class HindsightMemoryProvider(MemoryProvider):
         scored.sort(key=lambda x: -x[0])
         return scored
 
+    # ── 检索后去冗余：文本相似度折叠 ──
+    @staticmethod
+    def _dedup_recall_results(
+        scored: list,
+        similarity_threshold: float = 0.85,
+    ) -> list:
+        """MemGAS 启发：对 recall 结果做文本相似度去冗余。
+
+        Args:
+            scored: _rerank_with_time_decay 返回的 (score, decay, age, text, item) 列表
+            similarity_threshold: 文本相似度阈值，>此值视为冗余
+
+        Returns:
+            去重后的列表（保留高分条目）
+        """
+        from difflib import SequenceMatcher
+
+        def _text_sim(a: str, b: str) -> float:
+            return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+        deduped = []
+        for item in scored:
+            text = item[3]
+            is_dup = False
+            for existing in deduped:
+                if _text_sim(text, existing[3]) > similarity_threshold:
+                    is_dup = True
+                    break
+            if not is_dup:
+                deduped.append(item)
+
+        removed = len(scored) - len(deduped)
+        if removed > 0:
+            logger.debug("Dedup: removed %d/%d results (threshold=%.2f)",
+                         removed, len(scored), similarity_threshold)
+        return deduped
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1522,9 +1573,24 @@ class HindsightMemoryProvider(MemoryProvider):
             if not content:
                 return tool_error("Missing required parameter: content")
             context = args.get("context")
+            # 多粒度：summary 作为附加粒度描述，写入 context（不覆盖已有 context）
+            summary = args.get("summary")
+            if summary and not context:
+                context = summary
+            elif summary and context:
+                context = f"{context} | {summary}"
+
+            # 多粒度：keywords 合并到 tags
+            user_tags = list(args.get("tags") or [])
+            keywords = args.get("keywords")
+            if keywords:
+                for kw in keywords:
+                    kw_tag = f"kw:{kw}"
+                    if kw_tag not in user_tags:
+                        user_tags.append(kw_tag)
+
             # TiMEM P1: auto-infer scene and inject as tag (not content prefix)
             scene_tag = self._infer_scene(content)
-            user_tags = list(args.get("tags") or [])
             if scene_tag and scene_tag not in user_tags:
                 user_tags.append(scene_tag)
 
@@ -1575,7 +1641,9 @@ class HindsightMemoryProvider(MemoryProvider):
                     return json.dumps({"result": "No relevant memories found."})
                 # 艾宾浩斯时间衰减重排序
                 scored = self._rerank_with_time_decay(resp.results)
-                lines = [f"{i}. {s[3]}" for i, s in enumerate(scored, 1)]
+                # MemGAS 启发：检索后去冗余 — 文本相似度 >0.85 的折叠为一条
+                deduped = self._dedup_recall_results(scored)
+                lines = [f"{i}. {s[3]}" for i, s in enumerate(deduped, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
