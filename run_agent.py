@@ -755,8 +755,11 @@ class AIAgent:
         credential_pool=None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
+        checkpoint_max_total_size_mb: int = 500,
+        checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        openrouter_min_coding_score: Optional[float] = None,
     ):
         """
         Initialize the AI Agent.
@@ -830,6 +833,7 @@ class AIAgent:
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
         self._credential_pool = credential_pool
+        self.openrouter_min_coding_score = openrouter_min_coding_score
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
