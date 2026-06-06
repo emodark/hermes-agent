@@ -15,14 +15,16 @@ with the gateway.
 
 Design notes (parity with the Cline port):
   * Grep-friendly single-line format beginning ``[MEMORY]``.
+  * Reports **both** current RSS (from /proc/self/status VmRss) and
+    peak RSS (from resource.getrusage().ru_maxrss) — the original Cline
+    port used ru_maxrss which reports the process lifetime high-water
+    mark, not current usage, making it useless for leak detection.
   * Final snapshot logged on shutdown so "last RSS before exit" is
     always in the log.
   * Baseline snapshot logged immediately on start.
   * Daemon thread — never blocks process exit.
-  * Uses ``resource`` (stdlib, Linux/macOS) first and falls back to
-    ``psutil`` when ``resource`` isn't available (Windows).  Both are
-    optional; when neither works we emit a single WARNING and disable
-    the monitor rather than crashing the gateway.
+  * Reads /proc/self/status directly (Linux-only, no extra deps) and
+    falls back to ``psutil`` on other platforms.
 
 Config: ``logging.memory_monitor`` in ``config.yaml`` — see
 ``hermes_cli/config.py`` for the defaults block.
@@ -49,39 +51,58 @@ _interval_seconds: float = 300.0  # 5 minutes
 _lock = threading.Lock()
 
 
-def _get_rss_mb() -> Optional[int]:
-    """Return current process resident set size in MB, or None if unavailable.
+def _get_current_rss_mb() -> Optional[int]:
+    """Return current process RSS in MB by reading /proc/self/status.
 
-    Tries ``resource.getrusage`` first (Linux/macOS, no extra deps), then
-    falls back to ``psutil`` which is an optional hermes-agent dep.
+    This is the **real** current RSS, not the process lifetime peak.
+    Falls back to psutil if /proc is not available (macOS, Windows).
+
+    Why /proc/self/status instead of getrusage().ru_maxrss:
+      ``ru_maxrss`` reports the **peak** RSS over the process lifetime
+      (the high-water mark).  For a leak-detection monitor we need the
+      **current** RSS so we can see the trend over time.  A process that
+      peaked at 5GB during startup and settled at 2GB looks "leaking at
+      5GB" if you use ru_maxrss, which is misleading.
     """
-    # Linux / macOS — resource is stdlib.  On Linux ru_maxrss is in KB,
-    # on macOS it is in bytes (yes, really).  We use it as a cheap
-    # "current" RSS — ru_maxrss reports the high-water mark for the
-    # process, which is what you actually want for leak detection.
     try:
-        import resource
-
-        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if sys.platform == "darwin":
-            return int(maxrss / _BYTES_TO_MB)
-        # Linux / other unices: KB
-        return int(maxrss / 1024)
-    except Exception:
+        with open(f"/proc/{os.getpid()}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    # Format: "VmRSS:  1234567 kB"
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) // 1024
+    except (FileNotFoundError, IOError, ValueError, OSError):
         pass
 
-    # Fallback: psutil (Windows, or unusual unix without resource).
+    # Fallback: psutil (macOS, Windows, containers without /proc)
     try:
         import psutil  # type: ignore
-
         rss = psutil.Process(os.getpid()).memory_info().rss
         return int(rss / _BYTES_TO_MB)
     except Exception:
         return None
 
 
+def _get_peak_rss_mb() -> Optional[int]:
+    """Return process lifetime peak RSS in MB via resource.getrusage.
+
+    ``ru_maxrss`` is the high-water mark.  We report it alongside
+    current RSS so you can tell "still growing" from "startup spike".
+    On Linux ru_maxrss is in KB, on macOS in bytes.
+    """
+    try:
+        import resource
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return int(maxrss / _BYTES_TO_MB)
+        return int(maxrss / 1024)
+    except Exception:
+        return None
+
+
 def log_memory_usage(prefix: str = "") -> None:
-    """Log current memory usage in a grep-friendly ``[MEMORY] ...`` line.
+    """Log current + peak memory usage in a grep-friendly ``[MEMORY] ...`` line.
 
     Safe to call on-demand from any thread at important lifecycle
     moments (after shutdown, after context compression, etc.).
@@ -92,37 +113,34 @@ def log_memory_usage(prefix: str = "") -> None:
         Optional extra tag inserted after ``[MEMORY]`` — e.g.
         ``"baseline"``, ``"shutdown"``.
     """
-    rss = _get_rss_mb()
+    current = _get_current_rss_mb()
+    peak = _get_peak_rss_mb()
     uptime = int(time.monotonic() - _start_time) if _start_time else 0
-    # gc.get_stats() returns per-generation collection counts; the sum
-    # is a cheap proxy for "how much garbage have we created".
     try:
-        gc_counts = gc.get_count()  # (gen0, gen1, gen2)
+        gc_counts = gc.get_count()
     except Exception:
         gc_counts = (0, 0, 0)
-    # Thread count is a handy correlate when diagnosing thread leaks.
     try:
         thread_count = threading.active_count()
     except Exception:
         thread_count = 0
 
     tag = f"{prefix} " if prefix else ""
-    if rss is None:
+
+    if current is None:
         logger.info(
-            "[MEMORY] %srss=unavailable gc=%s threads=%d uptime=%ds",
-            tag,
-            gc_counts,
-            thread_count,
-            uptime,
+            "[MEMORY] %srss_cur=unavailable peak=%dMB gc=%s threads=%d uptime=%ds",
+            tag, peak or 0, gc_counts, thread_count, uptime,
+        )
+    elif peak is not None:
+        logger.info(
+            "[MEMORY] %srss_cur=%dMB peak=%dMB gc=%s threads=%d uptime=%ds",
+            tag, current, peak, gc_counts, thread_count, uptime,
         )
     else:
         logger.info(
-            "[MEMORY] %srss=%dMB gc=%s threads=%d uptime=%ds",
-            tag,
-            rss,
-            gc_counts,
-            thread_count,
-            uptime,
+            "[MEMORY] %srss_cur=%dMB peak=unavailable gc=%s threads=%d uptime=%ds",
+            tag, current, gc_counts, thread_count, uptime,
         )
 
 
@@ -132,7 +150,6 @@ def _monitor_loop(stop_event: threading.Event, interval: float) -> None:
         try:
             log_memory_usage()
         except Exception as e:
-            # Never let the monitor crash the gateway; just log and carry on.
             logger.debug("Memory monitor iteration failed: %s", e)
 
 
@@ -161,13 +178,10 @@ def start_memory_monitoring(interval_seconds: float = 300.0) -> bool:
         if _monitor_thread is not None and _monitor_thread.is_alive():
             return False
 
-        # Sanity-check that we can read RSS at all.  If neither resource
-        # nor psutil works, no point spinning a thread that can only log
-        # "rss=unavailable" forever — warn once and bail.
-        if _get_rss_mb() is None:
+        if _get_current_rss_mb() is None:
             logger.warning(
-                "[MEMORY] Memory monitoring unavailable: neither resource.getrusage "
-                "nor psutil could read process RSS — skipping periodic logging.",
+                "[MEMORY] Memory monitoring unavailable: neither /proc/self/status "
+                "nor psutil could read current RSS — skipping periodic logging.",
             )
             return False
 
@@ -175,7 +189,6 @@ def start_memory_monitoring(interval_seconds: float = 300.0) -> bool:
         _interval_seconds = float(interval_seconds)
         _stop_event = threading.Event()
 
-        # Baseline snapshot before the loop starts.
         log_memory_usage(prefix="baseline")
 
         _monitor_thread = threading.Thread(
@@ -204,7 +217,6 @@ def stop_memory_monitoring(timeout: float = 2.0) -> None:
         if _stop_event is None or _monitor_thread is None:
             return
 
-        # Final snapshot before teardown so "last RSS" is always in the log.
         try:
             log_memory_usage(prefix="shutdown")
         except Exception:
@@ -215,7 +227,6 @@ def stop_memory_monitoring(timeout: float = 2.0) -> None:
         _monitor_thread = None
         _stop_event = None
 
-    # Join outside the lock so a stuck log call can't deadlock shutdown.
     try:
         thread.join(timeout=timeout)
     except Exception:

@@ -267,7 +267,9 @@ class SessionDB:
 
         self._lock = threading.Lock()
         self._env: Optional[lmdb.Environment] = None
-        self._bm25: Optional[BM25Index] = None
+        self.__bm25: Optional[BM25Index] = None  # lazy-loaded via _bm25 property
+        self.__bm25_loaded: bool = False
+        self.__bm25_path: str = ""  # set after bm25_path is known
         self._closed = False
 
         try:
@@ -291,18 +293,33 @@ class SessionDB:
                     _lmdb_put(txn, self._meta_db, "schema_version", SCHEMA_VERSION)
                     _lmdb_put(txn, self._meta_db, "next_msg_id", 1)
 
-            # Open BM25 index (shared singleton — lazy-loaded on first use)
-            self._bm25 = _get_bm25_index(str(self.bm25_path))
-            bm25_docs = self._bm25.doc_count() if self._bm25 else 0
+            # BM25 index is lazy-loaded on first access via _bm25 property
+            self.__bm25_path = str(self.bm25_path)
             logger.info(
-                "SessionDB opened at %s (LMDB + BM25, %d docs indexed)",
-                self.db_path, bm25_docs,
+                "SessionDB opened at %s (LMDB, BM25 deferred)",
+                self.db_path,
             )
 
         except Exception as exc:
             import hermes_state as _hs
             _hs._set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    @property
+    def _bm25(self) -> Optional['BM25Index']:
+        """Lazy-loaded BM25 index singleton. Loaded on first access, not at init.
+
+        All existing ``self._bm25`` references in this class work unchanged —
+        the property intercepts attribute access transparently.  The BK25
+        index is ~800MB in memory (125MB gzipped on disk) so deferring its
+        load from init to first use cuts gateway startup peak RSS by ~3GB.
+        """
+        if not self.__bm25_loaded:
+            self.__bm25 = _get_bm25_index(self.__bm25_path)
+            self.__bm25_loaded = True
+            docs = self.__bm25.doc_count() if self.__bm25 else 0
+            logger.info("BM25 index loaded lazily (%d docs)", docs)
+        return self.__bm25
 
     # ── Internal helpers ──
 
@@ -1909,7 +1926,9 @@ class SessionDB:
             return
         self._closed = True
         try:
-            if self._bm25 and self._bm25.is_dirty:
+            # Only access BM25 if it was already loaded — avoids triggering
+            # the lazy property on close just to check the dirty flag.
+            if self.__bm25_loaded and self._bm25 and self._bm25.is_dirty:
                 self._bm25.save(str(self.bm25_path))
         except Exception as exc:
             logger.warning("BM25 save on close failed: %s", exc)

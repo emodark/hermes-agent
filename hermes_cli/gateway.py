@@ -3444,6 +3444,20 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
     _guard_official_docker_root_gateway()
     sys.path.insert(0, str(PROJECT_ROOT))
 
+    # ── Instinct bootstrap ──────────────────────────────────────
+    # Monkey-patches AIAgent._build_system_prompt at import time so
+    # instinct behavioral patterns are injected without modifying
+    # run_agent.py directly.
+    try:
+        from agent.instinct_bootstrap import install as _install_instinct
+        _install_instinct()
+    except Exception as _exc:
+        # Non-fatal — instinct injection is a quality-of-life feature.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Instinct bootstrap skipped: %s", _exc,
+        )
+
     # Detached Windows gateway runs must ignore console-control broadcasts
     # from sibling CLI processes, but foreground `hermes gateway run` still
     # needs to obey the banner's "Press Ctrl+C to stop" contract.

@@ -740,6 +740,7 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
+        user_id_alt: str = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
@@ -760,6 +761,7 @@ class AIAgent:
         pass_session_id: bool = False,
         persist_session: bool = True,
         openrouter_min_coding_score: Optional[float] = None,
+        load_soul_identity: bool = False,
     ):
         """
         Initialize the AI Agent.
@@ -817,6 +819,7 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
+        self.user_id_alt = user_id_alt  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
         self._user_name = user_name
         self._chat_id = chat_id
         self._chat_name = chat_name
@@ -834,6 +837,7 @@ class AIAgent:
         self.persist_session = persist_session
         self._credential_pool = credential_pool
         self.openrouter_min_coding_score = openrouter_min_coding_score
+        self.load_soul_identity = load_soul_identity
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -4221,14 +4225,9 @@ class AIAgent:
         if skills_prompt:
             prompt_parts.append(skills_prompt)
 
-        # ── Instinct system: inject learned behavioral patterns ──
-        try:
-            from agent.instincts import inject_instincts_prompt
-            instinct_prompt = inject_instincts_prompt(threshold=0.9, max_chars=300)
-            if instinct_prompt:
-                prompt_parts.append(instinct_prompt)
-        except Exception:
-            pass
+        # Instinct prompt injection handled by agent/instinct_bootstrap.py
+        # (monkey-patches _build_system_prompt_parts at import time to keep
+        # run_agent.py clean for upstream sync)
 
         if not self.skip_context_files:
             # Use TERMINAL_CWD for context file discovery when set (gateway

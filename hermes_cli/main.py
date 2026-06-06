@@ -1978,6 +1978,13 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    # ── Instinct bootstrap ──
+    try:
+        from agent.instinct_bootstrap import install as _install_instinct
+        _install_instinct()
+    except Exception:
+        pass
+
     use_tui = _resolve_use_tui(args)
 
     # Resolve --continue into --resume with the latest session or by name
