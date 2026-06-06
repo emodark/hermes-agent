@@ -48,6 +48,7 @@ class FailoverReason(enum.Enum):
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
+    reasoning_content_required = "reasoning_content_required"  # DeepSeek reasoning_content present but provider can't handle it — strip and retry
 
     # Request format
     format_error = "format_error"        # 400 bad request — abort or strip + retry
