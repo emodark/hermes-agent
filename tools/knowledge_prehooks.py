@@ -448,10 +448,34 @@ def delegate_task_prehook(name: str, args: dict) -> str | None:
     return "\n\n".join(parts) if parts else None
 
 
-# ── 注册 pre-hooks ──
-# 必须在模块顶层直接调用 registry.register_pre_hook() 才能被 AST 发现器扫描到
+# ── v0.18.0 适配：注册 pre-hooks ──
+# v0.18.0 移除了 registry.register_pre_hook() API。
+# 改用 dispatch 方法包装：在 import 时 patch registry.dispatch，
+# 在 terminal / delegate_task 执行前注入知识路由上下文。
 from tools.registry import registry  # noqa: E402
 
-registry.register_pre_hook("terminal", terminal_prehook)
-registry.register_pre_hook("delegate_task", delegate_task_prehook)
-logger.info("knowledge_router pre-hooks registered (terminal, delegate_task)")
+_PRE_HOOKS = {
+    "terminal": terminal_prehook,
+    "delegate_task": delegate_task_prehook,
+}
+
+_orig_dispatch = registry.dispatch
+
+
+def _patched_dispatch(name: str, args: dict, **kwargs) -> str:
+    """包装 dispatch：pre-hook 执行后调用原始 dispatch。"""
+    hook = _PRE_HOOKS.get(name)
+    if hook:
+        pre_result = hook(name, args)
+        if pre_result:
+            # 将 pre-hook 结果注入到 kwargs 中，让原始 handler 可通过 task_id/context 获取
+            existing = kwargs.pop("_pre_hook_context", None)
+            if existing:
+                kwargs["_pre_hook_context"] = f"{existing}\n\n{pre_result}"
+            else:
+                kwargs["_pre_hook_context"] = pre_result
+    return _orig_dispatch(name, args, **kwargs)
+
+
+registry.dispatch = _patched_dispatch
+logger.info("knowledge_router pre-hooks patched onto dispatch (terminal, delegate_task)")
